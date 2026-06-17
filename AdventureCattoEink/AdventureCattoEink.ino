@@ -16,6 +16,9 @@
 #include "sleeping_animation.h"
 #include "sleep_splash_night.h"
 #include "sleep_splash_day.h"
+#include "menu_cat_icon.h"
+#include "menu_reader_icon.h"
+#include "EreaderApp.h"
 
 extern uint8_t ImageBW[ALLSCREEN_BYTES];
 
@@ -59,7 +62,7 @@ extern uint8_t ImageBW[ALLSCREEN_BYTES];
 #define SLEEP_ANIMATION_TIMEOUT_MS 15000
 #define INACTIVITY_TIMEOUT_MS 30000
 #define MAIN_TOGGLE_HOLD_MS 3000
-#define RTC_PET_STATE_MAGIC 0xCA770004UL
+#define RTC_PET_STATE_MAGIC 0xCA770005UL
 #define WAKE_BUTTON_PIN_MASK ((1ULL << EXIT_KEY) | (1ULL << HOME_KEY) | (1ULL << NEXT_KEY) | (1ULL << OK_KEY) | (1ULL << PRV_KEY))
 
 // Local hour offset from UTC (seconds). Adjust for your timezone.
@@ -83,11 +86,25 @@ extern uint8_t ImageBW[ALLSCREEN_BYTES];
 #define PLAY_Y 68
 
 // Home screen layout
-#define HOME_MARKER_X 20
-#define HOME_LABEL_X 32
-#define HOME_TEXT_SIZE 16
-#define HOME_TAMAGOTCHI_Y 40
-#define HOME_EREADER_Y 70
+#define HOME_TITLE_TEXT_SIZE 16
+#define HOME_OPTION_TEXT_SIZE 16
+#define HOME_TITLE_X 37
+#define HOME_TITLE_Y 8
+#define HOME_TILE_Y 42
+#define HOME_TILE_W 110
+#define HOME_TILE_H 64
+#define HOME_TILE_GAP 10
+#define HOME_TAMAGOTCHI_X 10
+#define HOME_EREADER_X (HOME_TAMAGOTCHI_X + HOME_TILE_W + HOME_TILE_GAP)
+
+// Top-right age label
+#define AGE_TEXT_SIZE 12
+#define AGE_LABEL_MAX_CHARS 22
+#define AGE_LABEL_PAD 2
+#define AGE_LABEL_W ((AGE_LABEL_MAX_CHARS * (AGE_TEXT_SIZE / 2)) + (AGE_LABEL_PAD * 2))
+#define AGE_LABEL_H (AGE_TEXT_SIZE + 2)
+#define AGE_LABEL_X (SCREEN_W - AGE_LABEL_W)
+#define AGE_LABEL_Y 0
 
 enum AppMode {
   APP_HOME,
@@ -153,15 +170,19 @@ RTC_DATA_ATTR struct {
   uint8_t selectedAction;
   uint8_t appMode;
   uint8_t homeSelection;
+  uint8_t petAgeStarted;
   uint64_t sleepEntryUs;
   uint32_t epochSeconds;
   uint64_t epochSetUs;
+  uint32_t petBirthEpoch;
 } rtcPetState;
 
 // These ones actually change over time
 uint8_t peeValue = 100;
 uint8_t foodValue = 100;
 uint8_t playValue = 100;
+bool petAgeStarted = false;
+uint32_t petBirthEpoch = 0;
 
 #define ACTIVITY_MESSAGE_COUNT 4
 
@@ -187,6 +208,8 @@ const char* const eatActivityMessages[ACTIVITY_MESSAGE_COUNT] = {
 };
 
 const char* currentActivityMessage = "";
+
+void refreshRtcEpochFromClock();
 
 // Interrupt-driven input queue
 volatile InputEvent inputQueue[INPUT_QUEUE_SIZE];
@@ -330,6 +353,22 @@ void drawVerticalLsbImageCrop(
   }
 }
 
+void drawVerticalLsbBitmap(int destX, int destY, const uint8_t* data, int width, int height) {
+  for (int y = 0; y < height; y++) {
+    for (int x = 0; x < width; x++) {
+      int screenX = destX + x;
+      int screenY = destY + y;
+
+      if (screenX < 0 || screenX >= SCREEN_W || screenY < 0 || screenY >= SCREEN_H) {
+        continue;
+      }
+
+      bool pixelOn = getVerticalLsbPixel(data, width, x, y);
+      EPD_DrawPoint(screenX, screenY, pixelOn ? BLACK : WHITE);
+    }
+  }
+}
+
 void fillRect(int x, int y, int w, int h, int color) {
   for (int yy = y; yy < y + h; yy++) {
     for (int xx = x; xx < x + w; xx++) {
@@ -433,6 +472,81 @@ void selectActivityMessage(const char* const messages[]) {
   currentActivityMessage = messages[random(ACTIVITY_MESSAGE_COUNT)];
 }
 
+void resetPetAgeTimer() {
+  // Reset hook for handoff: call this before delivery to start the pet age at zero.
+  petAgeStarted = false;
+  petBirthEpoch = 0;
+  rtcPetState.petAgeStarted = 0;
+  rtcPetState.petBirthEpoch = 0;
+}
+
+void startPetAgeTimerIfNeeded() {
+  if (petAgeStarted) {
+    return;
+  }
+
+  petBirthEpoch = (uint32_t)time(NULL);
+  petAgeStarted = true;
+  rtcPetState.petAgeStarted = 1;
+  rtcPetState.petBirthEpoch = petBirthEpoch;
+  refreshRtcEpochFromClock();
+}
+
+uint32_t getPetAgeDays() {
+  if (!petAgeStarted || petBirthEpoch == 0) {
+    return 0;
+  }
+
+  uint32_t nowEpoch = (uint32_t)time(NULL);
+  if (nowEpoch <= petBirthEpoch) {
+    return 0;
+  }
+
+  return (nowEpoch - petBirthEpoch) / 86400UL;
+}
+
+void formatPetAgeLabel(char* out, size_t outSize) {
+  uint32_t days = getPetAgeDays();
+
+  if (days < 30) {
+    snprintf(out, outSize, "%lu %s", (unsigned long)days, days == 1 ? "Day" : "Days");
+    return;
+  }
+
+  if (days < 365) {
+    uint32_t months = days / 30;
+    snprintf(out, outSize, "%lu %s", (unsigned long)months, months == 1 ? "Month" : "Months");
+    return;
+  }
+
+  uint32_t years = days / 365;
+  uint32_t months = (days % 365) / 30;
+  snprintf(
+    out,
+    outSize,
+    "%lu %s %lu %s",
+    (unsigned long)years,
+    years == 1 ? "Year" : "Years",
+    (unsigned long)months,
+    months == 1 ? "Month" : "Months"
+  );
+}
+
+void drawAgeLabel() {
+  char label[AGE_LABEL_MAX_CHARS + 1] = {};
+  formatPetAgeLabel(label, sizeof(label));
+  fillRect(AGE_LABEL_X, AGE_LABEL_Y, AGE_LABEL_W, AGE_LABEL_H, WHITE);
+
+  int charW = AGE_TEXT_SIZE / 2;
+  int textW = strlen(label) * charW;
+  int x = SCREEN_W - textW - AGE_LABEL_PAD;
+  if (x < 0) {
+    x = 0;
+  }
+
+  EPD_ShowString(x, AGE_LABEL_Y, label, BLACK, AGE_TEXT_SIZE);
+}
+
 void drawHud() {
   clearLeftHudArea();
 
@@ -440,6 +554,8 @@ void drawHud() {
     drawWrappedActivityMessage(currentActivityMessage);
     return;
   }
+
+  drawAgeLabel();
 
   // Pee selector + bar
   drawSelectionMarker(ACTION_MARKER_X, PEE_Y + 4, selectedAction == ACTION_PEE);
@@ -457,20 +573,77 @@ void drawHud() {
   drawBar(ACTION_BAR_X, PLAY_Y + 4, ACTION_BAR_W, ACTION_BAR_H, playValue);
 }
 
-void drawHomeContent() {
-  drawSelectionMarker(
-    HOME_MARKER_X,
-    HOME_TAMAGOTCHI_Y + 4,
-    homeSelection == HOME_OPTION_TAMAGOTCHI
-  );
-  EPD_ShowString(HOME_LABEL_X, HOME_TAMAGOTCHI_Y, "TAMAGOTCHI", BLACK, HOME_TEXT_SIZE);
+void drawSelectedTileFrame(int x, int y, int w, int h, bool selected) {
+  EPD_DrawRectangle(x, y, x + w, y + h, BLACK);
 
-  drawSelectionMarker(
-    HOME_MARKER_X,
-    HOME_EREADER_Y + 4,
-    homeSelection == HOME_OPTION_EREADER
+  if (!selected) {
+    return;
+  }
+
+  EPD_DrawRectangle(x + 2, y + 2, x + w - 2, y + h - 2, BLACK);
+  fillRect(x + 5, y + 5, 10, 3, BLACK);
+  fillRect(x + 5, y + 5, 3, 10, BLACK);
+  fillRect(x + w - 14, y + 5, 10, 3, BLACK);
+  fillRect(x + w - 7, y + 5, 3, 10, BLACK);
+  fillRect(x + 5, y + h - 7, 10, 3, BLACK);
+  fillRect(x + 5, y + h - 14, 3, 10, BLACK);
+  fillRect(x + w - 14, y + h - 7, 10, 3, BLACK);
+  fillRect(x + w - 7, y + h - 14, 3, 10, BLACK);
+}
+
+void drawCatMenuIcon(int cx, int cy) {
+  drawVerticalLsbBitmap(
+    cx - (MENU_CAT_ICON_W / 2),
+    cy - (MENU_CAT_ICON_H / 2),
+    menuCatIcon,
+    MENU_CAT_ICON_W,
+    MENU_CAT_ICON_H
   );
-  EPD_ShowString(HOME_LABEL_X, HOME_EREADER_Y, "EREADER", BLACK, HOME_TEXT_SIZE);
+}
+
+void drawBookMenuIcon(int cx, int cy) {
+  drawVerticalLsbBitmap(
+    cx - (MENU_READER_ICON_W / 2),
+    cy - (MENU_READER_ICON_H / 2),
+    menuReaderIcon,
+    MENU_READER_ICON_W,
+    MENU_READER_ICON_H
+  );
+}
+
+void drawHomeTile(int x, const char* label, bool selected, bool catIcon) {
+  drawSelectedTileFrame(x, HOME_TILE_Y, HOME_TILE_W, HOME_TILE_H, selected);
+
+  int centerX = x + (HOME_TILE_W / 2);
+  int iconY = HOME_TILE_Y + 24;
+  if (catIcon) {
+    drawCatMenuIcon(centerX, iconY);
+  } else {
+    drawBookMenuIcon(centerX, iconY);
+  }
+
+  int charW = HOME_OPTION_TEXT_SIZE / 2;
+  int textW = strlen(label) * charW;
+  int textX = centerX - (textW / 2);
+  EPD_ShowString(textX, HOME_TILE_Y + 43, label, BLACK, HOME_OPTION_TEXT_SIZE);
+}
+
+void drawHomeContent() {
+  EPD_ShowString(HOME_TITLE_X, HOME_TITLE_Y, "WELCOME TUBELIGHT <3<3", BLACK, HOME_TITLE_TEXT_SIZE);
+
+  drawHomeTile(
+    HOME_TAMAGOTCHI_X,
+    "CATTO",
+    homeSelection == HOME_OPTION_TAMAGOTCHI,
+    true
+  );
+
+  drawHomeTile(
+    HOME_EREADER_X,
+    "READER",
+    homeSelection == HOME_OPTION_EREADER,
+    false
+  );
 }
 
 void showHomeScreenFull() {
@@ -496,7 +669,7 @@ void updateHomeSelectionPartial() {
 void drawEreaderPlaceholderScreen() {
   EPD_Init();
   clearImageBuffer();
-  EPD_ShowString(70, 48, "EREADER", BLACK, HOME_TEXT_SIZE);
+  EPD_ShowString(70, 48, "EREADER", BLACK, HOME_OPTION_TEXT_SIZE);
   EPD_ShowString(52, 72, "Coming soon", BLACK, ACTIVITY_TEXT_SIZE);
   fullRefresh();
 }
@@ -680,6 +853,12 @@ void refreshRtcEpochFromClock() {
 
 void initDeviceTime(bool restoreFromRtc) {
   if (restoreFromRtc && rtcPetState.epochSeconds > 100000) {
+    time_t retainedTime = time(NULL);
+    if (retainedTime >= (time_t)rtcPetState.epochSeconds) {
+      refreshRtcEpochFromClock();
+      return;
+    }
+
     struct timeval tv;
     tv.tv_sec = (time_t)rtcPetState.epochSeconds;
     tv.tv_usec = 0;
@@ -765,8 +944,9 @@ void initDefaultPetState() {
   foodValue = 100;
   playValue = 100;
   selectedAction = ACTION_PEE;
-  appMode = APP_TAMAGOTCHI;
+  appMode = APP_HOME;
   homeSelection = HOME_OPTION_TAMAGOTCHI;
+  resetPetAgeTimer();
 }
 
 void savePetStateToRtc() {
@@ -779,6 +959,8 @@ void savePetStateToRtc() {
   rtcPetState.selectedAction = selectedAction;
   rtcPetState.appMode = (uint8_t)appMode;
   rtcPetState.homeSelection = (uint8_t)homeSelection;
+  rtcPetState.petAgeStarted = petAgeStarted ? 1 : 0;
+  rtcPetState.petBirthEpoch = petBirthEpoch;
   rtcPetState.sleepEntryUs = esp_timer_get_time();
 }
 
@@ -793,6 +975,8 @@ bool restorePetStateFromRtc() {
   selectedAction = (SelectedAction)rtcPetState.selectedAction;
   appMode = (AppMode)rtcPetState.appMode;
   homeSelection = (HomeOption)rtcPetState.homeSelection;
+  petAgeStarted = rtcPetState.petAgeStarted != 0;
+  petBirthEpoch = rtcPetState.petBirthEpoch;
 
   if (appMode > APP_EREADER) {
     appMode = APP_TAMAGOTCHI;
@@ -835,6 +1019,10 @@ void enterDeepSleep() {
 
   savePetStateToRtc();
 
+  if (appMode == APP_EREADER) {
+    ereaderLeave();
+  }
+
   if (appMode == APP_HOME) {
     showModeSelectSplashScreen();
   } else {
@@ -855,6 +1043,10 @@ void enterDeepSleep() {
 void enterHomeScreen() {
   Serial.println("Entering home screen");
 
+  if (appMode == APP_EREADER) {
+    ereaderLeave();
+  }
+
   appMode = APP_HOME;
   petMode = PET_IDLE;
   activeAction = ACTIVE_NONE;
@@ -867,6 +1059,7 @@ void enterHomeScreen() {
 void enterTamagotchi() {
   Serial.println("Entering tamagotchi");
 
+  startPetAgeTimerIfNeeded();
   appMode = APP_TAMAGOTCHI;
   forceFullRefreshNextFrame = true;
   clearInputQueue();
@@ -875,12 +1068,12 @@ void enterTamagotchi() {
 }
 
 void enterEreaderMode() {
-  Serial.println("Entering ereader placeholder");
+  Serial.println("Entering ereader");
 
   appMode = APP_EREADER;
   clearInputQueue();
   lastActivityMs = millis();
-  drawEreaderPlaceholderScreen();
+  ereaderEnter();
 }
 
 void startIdle() {
@@ -1296,7 +1489,7 @@ void setup() {
   if (appMode == APP_HOME) {
     showHomeScreenFull();
   } else if (appMode == APP_EREADER) {
-    drawEreaderPlaceholderScreen();
+    enterEreaderMode();
   } else {
     startIdle();
   }
@@ -1326,10 +1519,18 @@ void loop() {
     }
 
     updateMainToggleInput();
+    if (appMode != APP_HOME) {
+      delay(5);
+      return;
+    }
 
     InputEvent event = popInputEvent();
     if (event != INPUT_NONE) {
       processInputEvent(event);
+      if (appMode != APP_HOME) {
+        delay(5);
+        return;
+      }
       delay(5);
       return;
     }
@@ -1360,8 +1561,19 @@ void loop() {
     }
 
     updateMainToggleInput();
+    if (appMode != APP_EREADER) {
+      delay(5);
+      return;
+    }
 
     while (popInputEvent() != INPUT_NONE) {}
+
+    ereaderLoop();
+
+    if (ereaderWantsSleep()) {
+      enterDeepSleep();
+      return;
+    }
 
     delay(5);
     return;

@@ -2,6 +2,7 @@
 #define _SPI_H_
 
 #include <Arduino.h>
+#include_next <SPI.h>
 
 //项目板子
 #define SCK 12
