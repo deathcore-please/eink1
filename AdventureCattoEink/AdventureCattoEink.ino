@@ -12,6 +12,7 @@
 #include "idle_animation.h"
 #include "eating_animation.h"
 #include "peeing_animation.h"
+#include "play_animation.h"
 #include "sleeping_animation.h"
 #include "sleep_splash_night.h"
 #include "sleep_splash_day.h"
@@ -38,8 +39,8 @@ extern uint8_t ImageBW[ALLSCREEN_BYTES];
 #define SCREEN_H 122
 
 // Fixed animation box - DO NOT MOVE
-#define ANIMATION_BOX_W 96
-#define ANIMATION_BOX_H 64
+#define ANIMATION_BOX_W 125
+#define ANIMATION_BOX_H 83
 #define ANIMATION_BOX_X (SCREEN_W - 1 - ANIMATION_BOX_W)
 #define ANIMATION_BOX_Y 34
 
@@ -57,25 +58,47 @@ extern uint8_t ImageBW[ALLSCREEN_BYTES];
 // Deep sleep settings
 #define SLEEP_ANIMATION_TIMEOUT_MS 15000
 #define INACTIVITY_TIMEOUT_MS 30000
-#define RTC_PET_STATE_MAGIC 0xCA770002UL
+#define MAIN_TOGGLE_HOLD_MS 3000
+#define RTC_PET_STATE_MAGIC 0xCA770004UL
 #define WAKE_BUTTON_PIN_MASK ((1ULL << EXIT_KEY) | (1ULL << HOME_KEY) | (1ULL << NEXT_KEY) | (1ULL << OK_KEY) | (1ULL << PRV_KEY))
 
 // Local hour offset from UTC (seconds). Adjust for your timezone.
 #define TIMEZONE_OFFSET_SEC (-5 * 3600)
 
 // HUD positions
-#define HAPPINESS_X 5
-#define HAPPINESS_Y 5
-#define HAPPINESS_W 100
-#define HAPPINESS_H 8
-
-#define ACTION_LABEL_X 18
-#define ACTION_BAR_X 62
+#define ACTION_MARKER_X 2
+#define ACTION_LABEL_X 8
+#define ACTION_BAR_X 40
 #define ACTION_BAR_W 78
-#define ACTION_BAR_H 8
+#define ACTION_BAR_H 4
+#define ACTION_TEXT_SIZE 12
+#define ACTIVITY_TEXT_SIZE 12
+#define ACTIVITY_MESSAGE_X 2
+#define ACTIVITY_MESSAGE_Y 20
+#define ACTIVITY_MESSAGE_LINE_H 14
+#define SELECTION_MARKER_SIZE 3
 
-#define PEE_Y 48
-#define FOOD_Y 72
+#define PEE_Y 28
+#define FOOD_Y 48
+#define PLAY_Y 68
+
+// Home screen layout
+#define HOME_MARKER_X 20
+#define HOME_LABEL_X 32
+#define HOME_TEXT_SIZE 16
+#define HOME_TAMAGOTCHI_Y 40
+#define HOME_EREADER_Y 70
+
+enum AppMode {
+  APP_HOME,
+  APP_TAMAGOTCHI,
+  APP_EREADER
+};
+
+enum HomeOption {
+  HOME_OPTION_TAMAGOTCHI,
+  HOME_OPTION_EREADER
+};
 
 enum PetMode {
   PET_IDLE,
@@ -84,13 +107,15 @@ enum PetMode {
 
 enum SelectedAction {
   ACTION_PEE,
-  ACTION_FOOD
+  ACTION_FOOD,
+  ACTION_PLAY
 };
 
 enum ActiveAction {
   ACTIVE_NONE,
   ACTIVE_PEE,
-  ACTIVE_FOOD
+  ACTIVE_FOOD,
+  ACTIVE_PLAY
 };
 
 enum InputEvent {
@@ -100,9 +125,15 @@ enum InputEvent {
   INPUT_DOWN
 };
 
+AppMode appMode = APP_TAMAGOTCHI;
+HomeOption homeSelection = HOME_OPTION_TAMAGOTCHI;
 PetMode petMode = PET_IDLE;
 SelectedAction selectedAction = ACTION_PEE;
 ActiveAction activeAction = ACTIVE_NONE;
+
+bool mainToggleDown = false;
+bool mainToggleHoldHandled = false;
+unsigned long mainToggleDownMs = 0;
 
 const Animation* currentAnimation = &idleAnimation;
 uint8_t currentFrame = 0;
@@ -118,19 +149,44 @@ RTC_DATA_ATTR struct {
   uint32_t magic;
   uint8_t peeValue;
   uint8_t foodValue;
-  uint8_t happinessValue;
+  uint8_t playValue;
   uint8_t selectedAction;
+  uint8_t appMode;
+  uint8_t homeSelection;
   uint64_t sleepEntryUs;
   uint32_t epochSeconds;
   uint64_t epochSetUs;
 } rtcPetState;
 
-// Hardcoded happiness for now
-uint8_t happinessValue = 75;
-
 // These ones actually change over time
 uint8_t peeValue = 100;
 uint8_t foodValue = 100;
+uint8_t playValue = 100;
+
+#define ACTIVITY_MESSAGE_COUNT 4
+
+const char* const peeActivityMessages[ACTIVITY_MESSAGE_COUNT] = {
+  "\"she looks so funny\"",
+  "\"what a dumbass cuteass, just like you\"",
+  "\"go poke her while she's peeing\"",
+  "\"dont' look at her she's embarassed haw\""
+};
+
+const char* const playActivityMessages[ACTIVITY_MESSAGE_COUNT] = {
+  "\"Not very athletic is she\"",
+  "\"Bad Throw\"",
+  "\"I think she'll last just one throw\"",
+  "\"Play with her more she needs to train\""
+};
+
+const char* const eatActivityMessages[ACTIVITY_MESSAGE_COUNT] = {
+  "\"Her greed makes me sick\"",
+  "\"If gluttony had a form\"",
+  "\"Is that healthy for her?\"",
+  "\"Bruh she inhaled that\""
+};
+
+const char* currentActivityMessage = "";
 
 // Interrupt-driven input queue
 volatile InputEvent inputQueue[INPUT_QUEUE_SIZE];
@@ -286,7 +342,7 @@ void fillRect(int x, int y, int w, int h, int color) {
 
 void clearLeftHudArea() {
   // Clear only the left-side UI area.
-  // This does not touch the 96x64 sprite box on the right.
+  // This does not touch the sprite box on the right.
   fillRect(0, 0, ANIMATION_BOX_X - 1, SCREEN_H, WHITE);
 }
 
@@ -307,28 +363,142 @@ void drawBar(int x, int y, int w, int h, uint8_t value) {
 
 void drawSelectionMarker(int x, int y, bool selected) {
   if (selected) {
-    fillRect(x, y, 6, 6, BLACK);
+    fillRect(x, y, SELECTION_MARKER_SIZE, SELECTION_MARKER_SIZE, BLACK);
   } else {
-    fillRect(x, y, 6, 6, WHITE);
-    EPD_DrawRectangle(x, y, x + 6, y + 6, BLACK);
+    fillRect(x, y, SELECTION_MARKER_SIZE, SELECTION_MARKER_SIZE, WHITE);
+    EPD_DrawRectangle(x, y, x + SELECTION_MARKER_SIZE, y + SELECTION_MARKER_SIZE, BLACK);
   }
+}
+
+void showTextLine(int x, int y, const char* line) {
+  EPD_ShowString(x, y, line, BLACK, ACTIVITY_TEXT_SIZE);
+}
+
+void drawWrappedActivityMessage(const char* message) {
+  if (message == NULL || message[0] == '\0') {
+    return;
+  }
+
+  const int charW = ACTIVITY_TEXT_SIZE / 2;
+  const int maxChars = (ANIMATION_BOX_X - ACTIVITY_MESSAGE_X - 4) / charW;
+  char line[32] = {};
+  int lineLen = 0;
+  int y = ACTIVITY_MESSAGE_Y;
+  const char* p = message;
+
+  while (*p != '\0' && y < SCREEN_H - ACTIVITY_MESSAGE_LINE_H) {
+    while (*p == ' ') {
+      p++;
+    }
+
+    if (*p == '\0') {
+      break;
+    }
+
+    const char* word = p;
+    int wordLen = 0;
+
+    while (p[wordLen] != '\0' && p[wordLen] != ' ') {
+      wordLen++;
+    }
+
+    int needsSpace = lineLen > 0 ? 1 : 0;
+    if (lineLen > 0 && lineLen + needsSpace + wordLen > maxChars) {
+      line[lineLen] = '\0';
+      showTextLine(ACTIVITY_MESSAGE_X, y, line);
+      y += ACTIVITY_MESSAGE_LINE_H;
+      lineLen = 0;
+      needsSpace = 0;
+    }
+
+    if (lineLen > 0 && lineLen < (int)sizeof(line) - 1) {
+      line[lineLen++] = ' ';
+    }
+
+    for (int i = 0; i < wordLen && lineLen < (int)sizeof(line) - 1; i++) {
+      line[lineLen++] = word[i];
+    }
+
+    p += wordLen;
+  }
+
+  if (lineLen > 0 && y < SCREEN_H) {
+    line[lineLen] = '\0';
+    showTextLine(ACTIVITY_MESSAGE_X, y, line);
+  }
+}
+
+void selectActivityMessage(const char* const messages[]) {
+  randomSeed((uint32_t)esp_timer_get_time() ^ (uint32_t)micros());
+  currentActivityMessage = messages[random(ACTIVITY_MESSAGE_COUNT)];
 }
 
 void drawHud() {
   clearLeftHudArea();
 
-  // Top-left happiness bar, no text for now
-  drawBar(HAPPINESS_X, HAPPINESS_Y, HAPPINESS_W, HAPPINESS_H, happinessValue);
+  if (petMode == PET_ACTION) {
+    drawWrappedActivityMessage(currentActivityMessage);
+    return;
+  }
 
   // Pee selector + bar
-  drawSelectionMarker(6, PEE_Y + 4, selectedAction == ACTION_PEE);
-  EPD_ShowString(ACTION_LABEL_X, PEE_Y, "Pee", BLACK, 16);
+  drawSelectionMarker(ACTION_MARKER_X, PEE_Y + 4, selectedAction == ACTION_PEE);
+  EPD_ShowString(ACTION_LABEL_X, PEE_Y, "PEE", BLACK, ACTION_TEXT_SIZE);
   drawBar(ACTION_BAR_X, PEE_Y + 4, ACTION_BAR_W, ACTION_BAR_H, peeValue);
 
   // Food selector + bar
-  drawSelectionMarker(6, FOOD_Y + 4, selectedAction == ACTION_FOOD);
-  EPD_ShowString(ACTION_LABEL_X, FOOD_Y, "Food", BLACK, 16);
+  drawSelectionMarker(ACTION_MARKER_X, FOOD_Y + 4, selectedAction == ACTION_FOOD);
+  EPD_ShowString(ACTION_LABEL_X, FOOD_Y, "FOOD", BLACK, ACTION_TEXT_SIZE);
   drawBar(ACTION_BAR_X, FOOD_Y + 4, ACTION_BAR_W, ACTION_BAR_H, foodValue);
+
+  // Play selector + bar
+  drawSelectionMarker(ACTION_MARKER_X, PLAY_Y + 4, selectedAction == ACTION_PLAY);
+  EPD_ShowString(ACTION_LABEL_X, PLAY_Y, "PLAY", BLACK, ACTION_TEXT_SIZE);
+  drawBar(ACTION_BAR_X, PLAY_Y + 4, ACTION_BAR_W, ACTION_BAR_H, playValue);
+}
+
+void drawHomeContent() {
+  drawSelectionMarker(
+    HOME_MARKER_X,
+    HOME_TAMAGOTCHI_Y + 4,
+    homeSelection == HOME_OPTION_TAMAGOTCHI
+  );
+  EPD_ShowString(HOME_LABEL_X, HOME_TAMAGOTCHI_Y, "TAMAGOTCHI", BLACK, HOME_TEXT_SIZE);
+
+  drawSelectionMarker(
+    HOME_MARKER_X,
+    HOME_EREADER_Y + 4,
+    homeSelection == HOME_OPTION_EREADER
+  );
+  EPD_ShowString(HOME_LABEL_X, HOME_EREADER_Y, "EREADER", BLACK, HOME_TEXT_SIZE);
+}
+
+void showHomeScreenFull() {
+  EPD_Init();
+  clearImageBuffer();
+  drawHomeContent();
+  fullRefresh();
+}
+
+void updateHomeSelectionPartial() {
+  EPD_Init();
+
+  for (int i = 0; i < ERASE_PULSES; i++) {
+    fillRect(0, 0, SCREEN_W, SCREEN_H, WHITE);
+    drawHomeContent();
+    EPD_DisplayImage(ImageBW);
+    EPD_PartUpdate();
+  }
+
+  EPD_Sleep();
+}
+
+void drawEreaderPlaceholderScreen() {
+  EPD_Init();
+  clearImageBuffer();
+  EPD_ShowString(70, 48, "EREADER", BLACK, HOME_TEXT_SIZE);
+  EPD_ShowString(52, 72, "Coming soon", BLACK, ACTIVITY_TEXT_SIZE);
+  fullRefresh();
 }
 
 // ---------------- SPRITE HELPERS ----------------
@@ -390,15 +560,22 @@ bool getSpritePixel(const uint8_t* sprite, const Animation* anim, int x, int y) 
 }
 
 void drawSprite(const uint8_t* sprite, const Animation* anim) {
-  for (int y = 0; y < anim->height; y++) {
-    for (int x = 0; x < anim->width; x++) {
-      bool pixelOn = getSpritePixel(sprite, anim, x, y);
+  for (int y = 0; y < ANIMATION_BOX_H; y++) {
+    int sampleY = (y * anim->height) / ANIMATION_BOX_H;
+
+    for (int x = 0; x < ANIMATION_BOX_W; x++) {
+      int sampleX = (x * anim->width) / ANIMATION_BOX_W;
+      bool pixelOn = getSpritePixel(sprite, anim, sampleX, sampleY);
       EPD_DrawPoint(ANIMATION_BOX_X + x, ANIMATION_BOX_Y + y, pixelOn ? BLACK : WHITE);
     }
   }
 }
 
 void drawAnimationFrame(const Animation* anim, const uint8_t* sprite) {
+  if (appMode != APP_TAMAGOTCHI) {
+    return;
+  }
+
   EPD_Init();
 
   if (forceFullRefreshNextFrame) {
@@ -442,6 +619,12 @@ void applyNeedDrainTicks(uint32_t ticks) {
   } else {
     foodValue = 0;
   }
+
+  if (playValue > totalDrain) {
+    playValue -= totalDrain;
+  } else {
+    playValue = 0;
+  }
 }
 
 void drainNeedsOverTime() {
@@ -463,6 +646,12 @@ void drainNeedsOverTime() {
     foodValue -= NEED_DRAIN_AMOUNT;
   } else {
     foodValue = 0;
+  }
+
+  if (playValue > NEED_DRAIN_AMOUNT) {
+    playValue -= NEED_DRAIN_AMOUNT;
+  } else {
+    playValue = 0;
   }
 }
 
@@ -519,6 +708,29 @@ bool isNightTime() {
   return hour >= 19 || hour < 7;
 }
 
+void showModeSelectSplashScreen() {
+  Serial.println("Mode select splash");
+
+  EPD_Init();
+  clearImageBuffer();
+  EPD_ShowString(88, 52, "SPLASH", BLACK, 16);
+  // #region agent log
+  uint32_t nonzeroBytes = 0;
+  for (uint32_t i = 0; i < ALLSCREEN_BYTES; i++) {
+    if (ImageBW[i] != 0) {
+      nonzeroBytes++;
+    }
+  }
+  Serial.printf(
+    "{\"sessionId\":\"439210\",\"hypothesisId\":\"A\",\"location\":"
+    "\"showModeSelectSplashScreen\",\"message\":\"splash buffer before refresh\","
+    "\"data\":{\"nonzeroBytes\":%lu},\"timestamp\":%lu}\n",
+    nonzeroBytes, millis()
+  );
+  // #endregion
+  fullRefresh();
+}
+
 void showSleepSplashScreen() {
   const uint8_t* image = daySleepSplash;
   int imageW = DAY_SLEEP_SPLASH_W;
@@ -549,10 +761,12 @@ void showSleepSplashScreen() {
 }
 
 void initDefaultPetState() {
-  happinessValue = 75;
   peeValue = 100;
   foodValue = 100;
+  playValue = 100;
   selectedAction = ACTION_PEE;
+  appMode = APP_TAMAGOTCHI;
+  homeSelection = HOME_OPTION_TAMAGOTCHI;
 }
 
 void savePetStateToRtc() {
@@ -561,8 +775,10 @@ void savePetStateToRtc() {
   rtcPetState.magic = RTC_PET_STATE_MAGIC;
   rtcPetState.peeValue = peeValue;
   rtcPetState.foodValue = foodValue;
-  rtcPetState.happinessValue = happinessValue;
+  rtcPetState.playValue = playValue;
   rtcPetState.selectedAction = selectedAction;
+  rtcPetState.appMode = (uint8_t)appMode;
+  rtcPetState.homeSelection = (uint8_t)homeSelection;
   rtcPetState.sleepEntryUs = esp_timer_get_time();
 }
 
@@ -573,13 +789,31 @@ bool restorePetStateFromRtc() {
 
   peeValue = rtcPetState.peeValue;
   foodValue = rtcPetState.foodValue;
-  happinessValue = rtcPetState.happinessValue;
+  playValue = rtcPetState.playValue;
   selectedAction = (SelectedAction)rtcPetState.selectedAction;
+  appMode = (AppMode)rtcPetState.appMode;
+  homeSelection = (HomeOption)rtcPetState.homeSelection;
+
+  if (appMode > APP_EREADER) {
+    appMode = APP_TAMAGOTCHI;
+  }
+
+  if (homeSelection > HOME_OPTION_EREADER) {
+    homeSelection = HOME_OPTION_TAMAGOTCHI;
+  }
+
   return true;
 }
 
 void applyNeedsSinceSleep() {
-  uint64_t elapsedUs = esp_timer_get_time() - rtcPetState.sleepEntryUs;
+  uint64_t nowUs = esp_timer_get_time();
+
+  if (nowUs < rtcPetState.sleepEntryUs) {
+    Serial.println("Skipping sleep need drain: timer reset during deep sleep");
+    return;
+  }
+
+  uint64_t elapsedUs = nowUs - rtcPetState.sleepEntryUs;
   uint32_t ticks = elapsedUs / ((uint64_t)NEED_DRAIN_INTERVAL_MS * 1000ULL);
   applyNeedDrainTicks(ticks);
 }
@@ -600,7 +834,12 @@ void enterDeepSleep() {
   Serial.println("Entering deep sleep");
 
   savePetStateToRtc();
-  showSleepSplashScreen();
+
+  if (appMode == APP_HOME) {
+    showModeSelectSplashScreen();
+  } else {
+    showSleepSplashScreen();
+  }
 
   digitalWrite(EPD_POWER, LOW);
   prepareWirelessForSleep();
@@ -612,6 +851,37 @@ void enterDeepSleep() {
 }
 
 // ---------------- ANIMATION CONTROL ----------------
+
+void enterHomeScreen() {
+  Serial.println("Entering home screen");
+
+  appMode = APP_HOME;
+  petMode = PET_IDLE;
+  activeAction = ACTIVE_NONE;
+  currentActivityMessage = "";
+  clearInputQueue();
+  lastActivityMs = millis();
+  showHomeScreenFull();
+}
+
+void enterTamagotchi() {
+  Serial.println("Entering tamagotchi");
+
+  appMode = APP_TAMAGOTCHI;
+  forceFullRefreshNextFrame = true;
+  clearInputQueue();
+  startIdle();
+  lastActivityMs = millis();
+}
+
+void enterEreaderMode() {
+  Serial.println("Entering ereader placeholder");
+
+  appMode = APP_EREADER;
+  clearInputQueue();
+  lastActivityMs = millis();
+  drawEreaderPlaceholderScreen();
+}
 
 void startIdle() {
   currentAnimation = &idleAnimation;
@@ -666,9 +936,26 @@ void startEating() {
   currentFrame = 0;
   petMode = PET_ACTION;
   activeAction = ACTIVE_FOOD;
+  selectActivityMessage(eatActivityMessages);
   lastFrameMs = millis();
 
   Serial.println("Eating animation started");
+
+  drawAnimationFrame(
+    currentAnimation,
+    getAnimationFrame(currentAnimation, currentFrame)
+  );
+}
+
+void startPlaying() {
+  currentAnimation = &playAnimation;
+  currentFrame = 0;
+  petMode = PET_ACTION;
+  activeAction = ACTIVE_PLAY;
+  selectActivityMessage(playActivityMessages);
+  lastFrameMs = millis();
+
+  Serial.println("Play animation started");
 
   drawAnimationFrame(
     currentAnimation,
@@ -681,6 +968,7 @@ void startPeeing() {
   currentFrame = 0;
   petMode = PET_ACTION;
   activeAction = ACTIVE_PEE;
+  selectActivityMessage(peeActivityMessages);
   lastFrameMs = millis();
 
   Serial.println("Peeing animation started");
@@ -700,8 +988,10 @@ void startSelectedAction() {
 
   if (selectedAction == ACTION_PEE) {
     startPeeing();
-  } else {
+  } else if (selectedAction == ACTION_FOOD) {
     startEating();
+  } else {
+    startPlaying();
   }
 }
 
@@ -716,17 +1006,24 @@ void finishActionAndReturnToIdle() {
     foodValue = 100;
   }
 
+  if (activeAction == ACTIVE_PLAY) {
+    playValue = 100;
+  }
+
   currentAnimation = &idleAnimation;
   currentFrame = 0;
   petMode = PET_IDLE;
   activeAction = ACTIVE_NONE;
-  lastFrameMs = millis();
-  lastNeedDrainMs = millis();
+  currentActivityMessage = "";
 
   drawAnimationFrame(
     currentAnimation,
     getAnimationFrame(currentAnimation, currentFrame)
   );
+
+  lastFrameMs = millis();
+  lastNeedDrainMs = millis();
+  lastActivityMs = millis();
 
   // Clear anything pressed during the action, then allow fresh inputs again.
   clearInputQueue();
@@ -763,29 +1060,130 @@ void advanceActionAnimation() {
 }
 
 void moveSelectionUp() {
-  if (selectedAction == ACTION_FOOD) {
+  if (selectedAction == ACTION_PLAY) {
+    selectedAction = ACTION_FOOD;
+  } else if (selectedAction == ACTION_FOOD) {
     selectedAction = ACTION_PEE;
   }
 
-  Serial.println("Selected: Pee");
+  Serial.print("Selected: ");
+  Serial.println(selectedAction == ACTION_PEE ? "Pee" : "Food");
 
   drawAnimationFrame(
     currentAnimation,
     getAnimationFrame(currentAnimation, currentFrame)
   );
+
+  lastActivityMs = millis();
 }
 
 void moveSelectionDown() {
   if (selectedAction == ACTION_PEE) {
     selectedAction = ACTION_FOOD;
+  } else if (selectedAction == ACTION_FOOD) {
+    selectedAction = ACTION_PLAY;
   }
 
-  Serial.println("Selected: Food");
+  Serial.print("Selected: ");
+  if (selectedAction == ACTION_PEE) {
+    Serial.println("Pee");
+  } else if (selectedAction == ACTION_FOOD) {
+    Serial.println("Food");
+  } else {
+    Serial.println("Play");
+  }
 
   drawAnimationFrame(
     currentAnimation,
     getAnimationFrame(currentAnimation, currentFrame)
   );
+
+  lastActivityMs = millis();
+}
+
+void moveHomeSelectionUp() {
+  if (homeSelection == HOME_OPTION_EREADER) {
+    homeSelection = HOME_OPTION_TAMAGOTCHI;
+  }
+
+  Serial.println("Home selection: Tamagotchi");
+  updateHomeSelectionPartial();
+  lastActivityMs = millis();
+}
+
+void moveHomeSelectionDown() {
+  if (homeSelection == HOME_OPTION_TAMAGOTCHI) {
+    homeSelection = HOME_OPTION_EREADER;
+  }
+
+  Serial.println("Home selection: Ereader");
+  updateHomeSelectionPartial();
+  lastActivityMs = millis();
+}
+
+void onMainToggleHold() {
+  lastActivityMs = millis();
+
+  if (appMode == APP_TAMAGOTCHI) {
+    enterHomeScreen();
+    return;
+  }
+
+  if (appMode == APP_EREADER) {
+    enterHomeScreen();
+  }
+}
+
+void onMainToggleTap() {
+  lastActivityMs = millis();
+
+  if (appMode == APP_HOME) {
+    if (homeSelection == HOME_OPTION_TAMAGOTCHI) {
+      enterTamagotchi();
+    } else {
+      enterEreaderMode();
+    }
+    return;
+  }
+
+  if (appMode == APP_TAMAGOTCHI && petMode == PET_IDLE) {
+    if (currentAnimation == &sleepingAnimation) {
+      returnToIdleFromDrowsy();
+    }
+
+    startSelectedAction();
+  }
+}
+
+bool isMainTogglePressed() {
+  return digitalRead(MAIN_TOGGLE_KEY) == LOW;
+}
+
+void updateMainToggleInput() {
+  bool pressed = isMainTogglePressed();
+  unsigned long now = millis();
+
+  if (pressed && !mainToggleDown) {
+    mainToggleDown = true;
+    mainToggleDownMs = now;
+    mainToggleHoldHandled = false;
+  }
+
+  if (pressed && mainToggleDown && !mainToggleHoldHandled) {
+    if (now - mainToggleDownMs >= MAIN_TOGGLE_HOLD_MS) {
+      mainToggleHoldHandled = true;
+      onMainToggleHold();
+    }
+  }
+
+  if (!pressed && mainToggleDown) {
+    if (!mainToggleHoldHandled) {
+      onMainToggleTap();
+    }
+
+    mainToggleDown = false;
+    mainToggleHoldHandled = false;
+  }
 }
 
 // ---------------- INPUT HANDLING ----------------
@@ -796,6 +1194,29 @@ void processInputEvent(InputEvent event) {
   }
 
   lastActivityMs = millis();
+
+  if (event == INPUT_MAIN) {
+    // Main toggle is handled via hold/tap polling.
+    return;
+  }
+
+  if (appMode == APP_HOME) {
+    if (event == INPUT_UP) {
+      moveHomeSelectionUp();
+      return;
+    }
+
+    if (event == INPUT_DOWN) {
+      moveHomeSelectionDown();
+      return;
+    }
+
+    return;
+  }
+
+  if (appMode == APP_EREADER) {
+    return;
+  }
 
   // While action is playing, events should not be processed.
   if (petMode == PET_ACTION) {
@@ -815,11 +1236,6 @@ void processInputEvent(InputEvent event) {
 
     if (event == INPUT_DOWN) {
       moveSelectionDown();
-      return;
-    }
-
-    if (event == INPUT_MAIN) {
-      startSelectedAction();
       return;
     }
   }
@@ -850,10 +1266,11 @@ void setup() {
 
   Serial.println("AdventureCattoEink");
   Serial.println("Interrupt input enabled");
-  Serial.println("Main toggle: select action");
-  Serial.println("Up/down: select pee or food");
+  Serial.println("Main toggle tap: select action / enter mode");
+  Serial.println("Main toggle hold (3s): exit to home screen");
+  Serial.println("Up/down: select pee, food, play, or home menu");
   Serial.println("Inputs are queued immediately on button press");
-  Serial.println("Input capture locks during pee/eat to prevent duplicate actions");
+  Serial.println("Input capture locks during actions to prevent duplicate actions");
 
   lastActivityMs = millis();
 
@@ -876,11 +1293,79 @@ void setup() {
 
   initDeviceTime(restoredFromRtc);
 
-  startIdle();
+  if (appMode == APP_HOME) {
+    showHomeScreenFull();
+  } else if (appMode == APP_EREADER) {
+    drawEreaderPlaceholderScreen();
+  } else {
+    startIdle();
+  }
+
+  lastFrameMs = millis();
+  lastNeedDrainMs = millis();
+  lastActivityMs = millis();
 }
 
 void loop() {
   unsigned long now = millis();
+
+  if (appMode == APP_HOME) {
+    drainNeedsOverTime();
+
+    if (discardWakeInput) {
+      while (popInputEvent() != INPUT_NONE) {}
+
+      if (allButtonsReleased()) {
+        discardWakeInput = false;
+        clearInputQueue();
+        lastActivityMs = millis();
+      }
+
+      delay(5);
+      return;
+    }
+
+    updateMainToggleInput();
+
+    InputEvent event = popInputEvent();
+    if (event != INPUT_NONE) {
+      processInputEvent(event);
+      delay(5);
+      return;
+    }
+
+    if (now - lastActivityMs >= INACTIVITY_TIMEOUT_MS) {
+      enterDeepSleep();
+      return;
+    }
+
+    delay(5);
+    return;
+  }
+
+  if (appMode == APP_EREADER) {
+    drainNeedsOverTime();
+
+    if (discardWakeInput) {
+      while (popInputEvent() != INPUT_NONE) {}
+
+      if (allButtonsReleased()) {
+        discardWakeInput = false;
+        clearInputQueue();
+        lastActivityMs = millis();
+      }
+
+      delay(5);
+      return;
+    }
+
+    updateMainToggleInput();
+
+    while (popInputEvent() != INPUT_NONE) {}
+
+    delay(5);
+    return;
+  }
 
   // While an action animation is playing, do not process inputs.
   // Interrupt capture is also locked, so new button presses are ignored.
@@ -894,7 +1379,7 @@ void loop() {
     return;
   }
 
-  // Short lockout after returning from pee/eat.
+  // Short lockout after returning from an action.
   if (now < inputLockoutUntil) {
     delay(5);
     return;
@@ -928,6 +1413,13 @@ void loop() {
   InputEvent event = popInputEvent();
   if (event != INPUT_NONE) {
     processInputEvent(event);
+    delay(5);
+    return;
+  }
+
+  updateMainToggleInput();
+
+  if (appMode != APP_TAMAGOTCHI) {
     delay(5);
     return;
   }
