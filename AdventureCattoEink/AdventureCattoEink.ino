@@ -112,6 +112,7 @@ unsigned long lastNeedDrainMs = 0;
 unsigned long lastActivityMs = 0;
 unsigned long inputLockoutUntil = 0;
 bool discardWakeInput = false;
+bool forceFullRefreshNextFrame = false;
 
 RTC_DATA_ATTR struct {
   uint32_t magic;
@@ -399,6 +400,15 @@ void drawSprite(const uint8_t* sprite, const Animation* anim) {
 
 void drawAnimationFrame(const Animation* anim, const uint8_t* sprite) {
   EPD_Init();
+
+  if (forceFullRefreshNextFrame) {
+    forceFullRefreshNextFrame = false;
+    clearImageBuffer();
+    drawSprite(sprite, anim);
+    drawHud();
+    fullRefresh();
+    return;
+  }
 
   for (int i = 0; i < ERASE_PULSES; i++) {
     eraseSpriteArea(anim);
@@ -851,6 +861,7 @@ void setup() {
   if (wakeCause == ESP_SLEEP_WAKEUP_EXT1) {
     Serial.println("Woke from deep sleep");
     discardWakeInput = true;
+    forceFullRefreshNextFrame = true;
     clearInputQueue();
 
     if (restorePetStateFromRtc()) {
