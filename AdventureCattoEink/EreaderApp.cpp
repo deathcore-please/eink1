@@ -30,13 +30,20 @@ struct PageData {
   bool eof = false;
 };
 
+struct PageCheckpoint {
+  uint32_t pageIndex = 0;
+  uint32_t pos = 0;
+};
+
 struct ReaderState {
   File file;
   String path;
   size_t size = 0;
+  uint32_t pageIndex = 0;
+  uint32_t prevPagePos = 0;
   uint32_t pagePos = 0;
   uint32_t nextPagePos = 0;
-  std::vector<uint32_t> history;
+  std::vector<PageCheckpoint> checkpoints;
 };
 
 ReaderState reader;
@@ -52,6 +59,9 @@ bool storageReady = false;
 RTC_DATA_ATTR uint32_t ereaderRtcMagic = 0;
 RTC_DATA_ATTR uint8_t ereaderRtcScreen = static_cast<uint8_t>(ScreenId::MenuLibrary);
 constexpr uint32_t EREADER_RTC_MAGIC = 0xEAD30001UL;
+constexpr uint32_t NAV_STATE_VERSION = 1001UL;
+constexpr uint32_t NAV_CHECKPOINT_INTERVAL = 20UL;
+constexpr size_t NAV_MAX_CHECKPOINTS = 512;
 
 bool canResumeReaderScreen() {
   return ereaderRtcMagic == EREADER_RTC_MAGIC &&
@@ -74,6 +84,138 @@ String titleFromPath(const String& path) {
     return "Book";
   }
   return name;
+}
+
+String navigationPathForBook(const String& bookPath) {
+  int slash = bookPath.lastIndexOf('/');
+  String base = (slash >= 0) ? bookPath.substring(slash + 1) : bookPath;
+  String safe = storageSanitizeFilename(base);
+  int dot = safe.lastIndexOf('.');
+  if (dot > 0) {
+    safe = safe.substring(0, dot);
+  }
+  return String(Config::PROGRESS_DIR) + "/" + safe + ".nav";
+}
+
+void resetNavigationState() {
+  reader.pageIndex = 0;
+  reader.prevPagePos = 0;
+  reader.pagePos = 0;
+  reader.nextPagePos = 0;
+  reader.checkpoints.clear();
+  PageCheckpoint first;
+  first.pageIndex = 0;
+  first.pos = 0;
+  reader.checkpoints.push_back(first);
+}
+
+void addOrUpdateCheckpoint(uint32_t pageIndex, uint32_t pos) {
+  if (pageIndex % NAV_CHECKPOINT_INTERVAL != 0) {
+    return;
+  }
+  if (pos > reader.size) {
+    return;
+  }
+
+  for (size_t i = 0; i < reader.checkpoints.size(); ++i) {
+    if (reader.checkpoints[i].pageIndex == pageIndex) {
+      reader.checkpoints[i].pos = pos;
+      return;
+    }
+    if (reader.checkpoints[i].pageIndex > pageIndex) {
+      PageCheckpoint checkpoint;
+      checkpoint.pageIndex = pageIndex;
+      checkpoint.pos = pos;
+      reader.checkpoints.insert(reader.checkpoints.begin() + i, checkpoint);
+      return;
+    }
+  }
+
+  PageCheckpoint checkpoint;
+  checkpoint.pageIndex = pageIndex;
+  checkpoint.pos = pos;
+  reader.checkpoints.push_back(checkpoint);
+}
+
+const PageCheckpoint& nearestCheckpointForPage(uint32_t pageIndex) {
+  size_t bestIndex = 0;
+  for (size_t i = 0; i < reader.checkpoints.size(); ++i) {
+    if (reader.checkpoints[i].pageIndex > pageIndex) {
+      break;
+    }
+    bestIndex = i;
+  }
+  return reader.checkpoints[bestIndex];
+}
+
+bool loadNavigationState(uint32_t savedPos) {
+  String navPath = navigationPathForBook(reader.path);
+  File file = LittleFS.open(navPath, "r");
+  if (!file) {
+    return false;
+  }
+
+  uint32_t version = file.parseInt();
+  uint32_t bookSize = file.parseInt();
+  uint32_t pageIndex = file.parseInt();
+  uint32_t pagePos = file.parseInt();
+  uint32_t count = file.parseInt();
+
+  if (version != NAV_STATE_VERSION ||
+      bookSize != reader.size ||
+      pagePos != savedPos ||
+      pagePos >= reader.size ||
+      count == 0 ||
+      count > NAV_MAX_CHECKPOINTS) {
+    file.close();
+    return false;
+  }
+
+  reader.checkpoints.clear();
+  for (uint32_t i = 0; i < count; ++i) {
+    PageCheckpoint checkpoint;
+    checkpoint.pageIndex = file.parseInt();
+    checkpoint.pos = file.parseInt();
+    if (checkpoint.pos <= reader.size) {
+      reader.checkpoints.push_back(checkpoint);
+    }
+  }
+  file.close();
+
+  if (reader.checkpoints.empty() || reader.checkpoints[0].pageIndex != 0 || reader.checkpoints[0].pos != 0) {
+    resetNavigationState();
+    return false;
+  }
+
+  reader.pageIndex = pageIndex;
+  reader.pagePos = pagePos;
+  reader.prevPagePos = pagePos;
+  reader.nextPagePos = pagePos;
+  return true;
+}
+
+void saveNavigationState() {
+  if (!reader.file || reader.path.length() == 0) {
+    return;
+  }
+
+  String navPath = navigationPathForBook(reader.path);
+  File file = LittleFS.open(navPath, "w");
+  if (!file) {
+    return;
+  }
+
+  file.println(NAV_STATE_VERSION);
+  file.println(static_cast<uint32_t>(reader.size));
+  file.println(reader.pageIndex);
+  file.println(reader.pagePos);
+  file.println(static_cast<uint32_t>(reader.checkpoints.size()));
+  for (size_t i = 0; i < reader.checkpoints.size(); ++i) {
+    file.print(reader.checkpoints[i].pageIndex);
+    file.print(' ');
+    file.println(reader.checkpoints[i].pos);
+  }
+  file.close();
 }
 
 PageData readPage(File& file) {
@@ -150,6 +292,10 @@ ScreenId nextMenu(ScreenId target) {
   }
 }
 
+uint32_t measureNextPagePos(uint32_t fromPos);
+bool pagePosForIndex(uint32_t targetPageIndex, uint32_t& outPos);
+void rebuildNavigationToPosition(uint32_t targetPos);
+
 void openBook(const String& path, bool resetPos) {
   if (reader.file) {
     reader.file.close();
@@ -167,10 +313,16 @@ void openBook(const String& path, bool resetPos) {
   if (pos >= reader.size) {
     pos = 0;
   }
-  reader.pagePos = pos;
-  reader.nextPagePos = pos;
+
+  if (resetPos) {
+    LittleFS.remove(navigationPathForBook(reader.path));
+  }
+
+  if (pos == 0 || !loadNavigationState(pos)) {
+    rebuildNavigationToPosition(pos);
+  }
+
   reader.file.seek(reader.pagePos);
-  reader.history.clear();
   storageSetCurrentBook(reader.path);
   partialCount = 0;
 }
@@ -182,7 +334,6 @@ void renderCurrentPage(bool allowPartial) {
 
   reader.file.seek(reader.pagePos);
   PageData page = readPage(reader.file);
-  storageSaveProgress(reader.path, reader.pagePos);
 
   ReaderView view;
   view.title = titleFromPath(reader.path);
@@ -195,10 +346,30 @@ void renderCurrentPage(bool allowPartial) {
   bool usePartial = allowPartial && (partialCount < Config::PARTIAL_REFRESH_LIMIT);
   uiDrawReader(display, view, usePartial);
 
+  if (view.bytesConsumed == 0 && page.endPos > reader.pagePos) {
+    view.bytesConsumed = page.endPos - reader.pagePos;
+  }
+
   reader.nextPagePos = reader.pagePos + view.bytesConsumed;
+  if (reader.nextPagePos <= reader.pagePos && reader.pagePos < reader.size) {
+    reader.nextPagePos = reader.pagePos + 1;
+  }
   if (reader.nextPagePos >= reader.size) {
     reader.nextPagePos = reader.size;
   }
+
+  addOrUpdateCheckpoint(reader.pageIndex, reader.pagePos);
+  if (reader.pageIndex == 0) {
+    reader.prevPagePos = reader.pagePos;
+  } else {
+    uint32_t previousPos = reader.pagePos;
+    if (pagePosForIndex(reader.pageIndex - 1, previousPos)) {
+      reader.prevPagePos = previousPos;
+    }
+  }
+
+  storageSaveProgress(reader.path, reader.pagePos);
+  saveNavigationState();
 
   if (usePartial) {
     partialCount++;
@@ -207,24 +378,113 @@ void renderCurrentPage(bool allowPartial) {
   }
 }
 
+uint32_t measureNextPagePos(uint32_t fromPos) {
+  if (!reader.file || fromPos >= reader.size) {
+    return reader.size;
+  }
+
+  reader.file.seek(fromPos);
+  PageData page = readPage(reader.file);
+  size_t bytesConsumed = uiMeasureReaderBytes(display, page.text);
+
+  if (bytesConsumed == 0 && page.endPos > fromPos) {
+    bytesConsumed = page.endPos - fromPos;
+  }
+
+  uint32_t nextPos = fromPos + static_cast<uint32_t>(bytesConsumed);
+  if (nextPos <= fromPos) {
+    nextPos = fromPos + 1;
+  }
+  if (nextPos > reader.size) {
+    nextPos = reader.size;
+  }
+
+  return nextPos;
+}
+
+bool pagePosForIndex(uint32_t targetPageIndex, uint32_t& outPos) {
+  if (!reader.file) {
+    return false;
+  }
+  if (targetPageIndex == reader.pageIndex) {
+    outPos = reader.pagePos;
+    return true;
+  }
+
+  const PageCheckpoint& checkpoint = nearestCheckpointForPage(targetPageIndex);
+  uint32_t cursorIndex = checkpoint.pageIndex;
+  uint32_t cursorPos = checkpoint.pos;
+
+  while (cursorIndex < targetPageIndex && cursorPos < reader.size) {
+    uint32_t nextPos = measureNextPagePos(cursorPos);
+    if (nextPos <= cursorPos) {
+      return false;
+    }
+
+    cursorIndex++;
+    cursorPos = nextPos;
+    addOrUpdateCheckpoint(cursorIndex, cursorPos);
+  }
+
+  outPos = cursorPos;
+  return cursorIndex == targetPageIndex;
+}
+
+void rebuildNavigationToPosition(uint32_t targetPos) {
+  resetNavigationState();
+
+  uint32_t cursorIndex = 0;
+  uint32_t cursorPos = 0;
+  while (cursorPos < targetPos && cursorPos < reader.size) {
+    uint32_t nextPos = measureNextPagePos(cursorPos);
+    if (nextPos <= cursorPos) {
+      break;
+    }
+
+    uint32_t nextIndex = cursorIndex + 1;
+    if (nextPos > targetPos) {
+      break;
+    }
+
+    cursorIndex = nextIndex;
+    cursorPos = nextPos;
+    addOrUpdateCheckpoint(cursorIndex, cursorPos);
+  }
+
+  reader.pageIndex = cursorIndex;
+  reader.pagePos = cursorPos;
+  reader.prevPagePos = cursorPos;
+  reader.nextPagePos = cursorPos;
+}
+
 void renderNextPage() {
   if (!reader.file || reader.pagePos >= reader.size) {
     return;
   }
-  reader.history.push_back(reader.pagePos);
-  if (reader.history.size() > 50) {
-    reader.history.erase(reader.history.begin());
+  if (reader.nextPagePos <= reader.pagePos || reader.nextPagePos >= reader.size) {
+    return;
   }
+
+  reader.pageIndex++;
   reader.pagePos = reader.nextPagePos;
   renderCurrentPage(true);
 }
 
 void renderPrevPage() {
-  if (reader.history.empty()) {
+  if (!reader.file || reader.pageIndex == 0) {
     return;
   }
-  reader.pagePos = reader.history.back();
-  reader.history.pop_back();
+
+  uint32_t targetPos = reader.prevPagePos;
+  if (targetPos >= reader.pagePos && !pagePosForIndex(reader.pageIndex - 1, targetPos)) {
+    return;
+  }
+  if (targetPos >= reader.pagePos) {
+    return;
+  }
+
+  reader.pageIndex--;
+  reader.pagePos = targetPos;
   reader.nextPagePos = reader.pagePos;
   renderCurrentPage(true);
 }
@@ -414,13 +674,11 @@ void ereaderBegin() {
   pinMode(Config::PIN_EPD_POWER, OUTPUT);
   digitalWrite(Config::PIN_EPD_POWER, HIGH);
 
-  uiInit(display);
-  buttons.begin();
-
   if (Config::BATTERY_ADC_PIN >= 0) {
     analogReadResolution(12);
   }
 
+  uiInit(display);
   storageReady = ensureStorageReady();
   initialized = true;
   lastActivity = millis();
@@ -429,6 +687,8 @@ void ereaderBegin() {
 void ereaderEnter() {
   ereaderBegin();
   digitalWrite(Config::PIN_EPD_POWER, HIGH);
+  uiInit(display);
+  buttons.begin();
 
   if (!storageReady) {
     ensureStorageReady();
@@ -458,9 +718,10 @@ void ereaderLoop() {
 void ereaderLeave() {
   if (reader.file) {
     storageSaveProgress(reader.path, reader.pagePos);
+    saveNavigationState();
   }
   saveEreaderResumeScreen(screen);
-  display.hibernate();
+  display.powerOff();
 }
 
 bool ereaderWantsSleep() {

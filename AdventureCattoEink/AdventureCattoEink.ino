@@ -13,6 +13,11 @@
 #include "eating_animation.h"
 #include "peeing_animation.h"
 #include "play_animation.h"
+#include "petting_animation.h"
+#include "sad_hungry_animation.h"
+#include "sad_pee_animation.h"
+#include "sad_play_animation.h"
+#include "sad_pet_animation.h"
 #include "sleeping_animation.h"
 #include "sleep_splash_night.h"
 #include "sleep_splash_day.h"
@@ -31,6 +36,7 @@ extern uint8_t ImageBW[ALLSCREEN_BYTES];
 
 // Button meanings for this version
 #define MAIN_TOGGLE_KEY OK_KEY
+#define MENU_BUTTON_KEY HOME_KEY
 #define UP_KEY          PRV_KEY
 #define DOWN_KEY        NEXT_KEY
 
@@ -53,16 +59,18 @@ extern uint8_t ImageBW[ALLSCREEN_BYTES];
 // Input queue settings
 #define INPUT_QUEUE_SIZE 12
 #define ISR_DEBOUNCE_US 50000
+#define DIRECTION_REARM_MS 70
 
 // Need/meter settings
-#define NEED_DRAIN_INTERVAL_MS 5000
-#define NEED_DRAIN_AMOUNT 2
+#define NEED_FULL_DRAIN_SECONDS (3UL * 60UL)
+#define NEED_MAX_VALUE 100UL
+#define NEED_SAD_THRESHOLD 10
 
 // Deep sleep settings
 #define SLEEP_ANIMATION_TIMEOUT_MS 15000
 #define INACTIVITY_TIMEOUT_MS 30000
-#define MAIN_TOGGLE_HOLD_MS 3000
-#define RTC_PET_STATE_MAGIC 0xCA770005UL
+#define MENU_BUTTON_DEBOUNCE_MS 30
+#define RTC_PET_STATE_MAGIC 0xCA77000AUL
 #define WAKE_BUTTON_PIN_MASK ((1ULL << EXIT_KEY) | (1ULL << HOME_KEY) | (1ULL << NEXT_KEY) | (1ULL << OK_KEY) | (1ULL << PRV_KEY))
 
 // Local hour offset from UTC (seconds). Adjust for your timezone.
@@ -70,7 +78,8 @@ extern uint8_t ImageBW[ALLSCREEN_BYTES];
 
 // HUD positions
 #define ACTION_MARKER_X 2
-#define ACTION_LABEL_X 8
+#define ACTION_MARKER_SIZE 6
+#define ACTION_LABEL_X 12
 #define ACTION_BAR_X 40
 #define ACTION_BAR_W 78
 #define ACTION_BAR_H 4
@@ -79,11 +88,11 @@ extern uint8_t ImageBW[ALLSCREEN_BYTES];
 #define ACTIVITY_MESSAGE_X 2
 #define ACTIVITY_MESSAGE_Y 20
 #define ACTIVITY_MESSAGE_LINE_H 14
-#define SELECTION_MARKER_SIZE 3
 
 #define PEE_Y 28
 #define FOOD_Y 48
 #define PLAY_Y 68
+#define LOVE_Y 88
 
 // Home screen layout
 #define HOME_TITLE_TEXT_SIZE 16
@@ -125,14 +134,24 @@ enum PetMode {
 enum SelectedAction {
   ACTION_PEE,
   ACTION_FOOD,
-  ACTION_PLAY
+  ACTION_PLAY,
+  ACTION_PET
 };
 
 enum ActiveAction {
   ACTIVE_NONE,
   ACTIVE_PEE,
   ACTIVE_FOOD,
-  ACTIVE_PLAY
+  ACTIVE_PLAY,
+  ACTIVE_PET
+};
+
+enum SadNeed {
+  SAD_NEED_NONE,
+  SAD_NEED_PEE,
+  SAD_NEED_FOOD,
+  SAD_NEED_PLAY,
+  SAD_NEED_PETS
 };
 
 enum InputEvent {
@@ -147,10 +166,12 @@ HomeOption homeSelection = HOME_OPTION_TAMAGOTCHI;
 PetMode petMode = PET_IDLE;
 SelectedAction selectedAction = ACTION_PEE;
 ActiveAction activeAction = ACTIVE_NONE;
+SadNeed activeSadNeed = SAD_NEED_NONE;
 
-bool mainToggleDown = false;
-bool mainToggleHoldHandled = false;
-unsigned long mainToggleDownMs = 0;
+bool menuButtonDown = false;
+bool menuButtonRawDown = false;
+unsigned long menuButtonLastChangeMs = 0;
+bool mainInputInterruptsAttached = false;
 
 const Animation* currentAnimation = &idleAnimation;
 uint8_t currentFrame = 0;
@@ -159,6 +180,8 @@ unsigned long lastFrameMs = 0;
 unsigned long lastNeedDrainMs = 0;
 unsigned long lastActivityMs = 0;
 unsigned long inputLockoutUntil = 0;
+unsigned long upReleasedSinceMs = 0;
+unsigned long downReleasedSinceMs = 0;
 bool discardWakeInput = false;
 bool forceFullRefreshNextFrame = false;
 
@@ -167,40 +190,60 @@ RTC_DATA_ATTR struct {
   uint8_t peeValue;
   uint8_t foodValue;
   uint8_t playValue;
+  uint8_t loveValue;
+  uint8_t activeSadNeed;
   uint8_t selectedAction;
   uint8_t appMode;
   uint8_t homeSelection;
   uint8_t petAgeStarted;
-  uint64_t sleepEntryUs;
   uint32_t epochSeconds;
   uint64_t epochSetUs;
   uint32_t petBirthEpoch;
+  uint32_t sleepEntryEpoch;
+  uint32_t lastNeedDrainEpoch;
+  uint32_t needDrainCarry;
 } rtcPetState;
 
 // These ones actually change over time
 uint8_t peeValue = 100;
 uint8_t foodValue = 100;
 uint8_t playValue = 100;
+uint8_t loveValue = 100;
 bool petAgeStarted = false;
 uint32_t petBirthEpoch = 0;
+uint32_t lastNeedDrainEpoch = 0;
+uint32_t needDrainCarry = 0;
 
-#define ACTIVITY_MESSAGE_COUNT 4
+#define PEE_ACTIVITY_MESSAGE_COUNT 4
+#define PLAY_ACTIVITY_MESSAGE_COUNT 4
+#define PET_ACTIVITY_MESSAGE_COUNT 7
+#define EAT_ACTIVITY_MESSAGE_COUNT 4
 
-const char* const peeActivityMessages[ACTIVITY_MESSAGE_COUNT] = {
+const char* const peeActivityMessages[PEE_ACTIVITY_MESSAGE_COUNT] = {
   "\"she looks so funny\"",
   "\"what a dumbass cuteass, just like you\"",
   "\"go poke her while she's peeing\"",
   "\"dont' look at her she's embarassed haw\""
 };
 
-const char* const playActivityMessages[ACTIVITY_MESSAGE_COUNT] = {
+const char* const playActivityMessages[PLAY_ACTIVITY_MESSAGE_COUNT] = {
   "\"Not very athletic is she\"",
   "\"Bad Throw\"",
   "\"I think she'll last just one throw\"",
   "\"Play with her more she needs to train\""
 };
 
-const char* const eatActivityMessages[ACTIVITY_MESSAGE_COUNT] = {
+const char* const petActivityMessages[PET_ACTIVITY_MESSAGE_COUNT] = {
+  "\"she pretends not to like it\"",
+  "\"tiny head, big thoughts\"",
+  "\"she is accepting affection\"",
+  "\"critical softness detected\"",
+  "\"Keep her safe unless you want me to steal her\"",
+  "\"Yeah you like it don't you\"",
+  "\"This needs a new animation\""
+};
+
+const char* const eatActivityMessages[EAT_ACTIVITY_MESSAGE_COUNT] = {
   "\"Her greed makes me sick\"",
   "\"If gluttony had a form\"",
   "\"Is that healthy for her?\"",
@@ -219,6 +262,10 @@ volatile uint8_t inputQueueTail = 0;
 volatile uint32_t lastMainIsrUs = 0;
 volatile uint32_t lastUpIsrUs = 0;
 volatile uint32_t lastDownIsrUs = 0;
+volatile uint32_t lastMenuIsrUs = 0;
+volatile bool menuButtonPressPending = false;
+volatile bool upInputArmed = true;
+volatile bool downInputArmed = true;
 
 // Locks interrupt capture while an action animation is running.
 // This prevents accidental double-presses from being queued and replayed.
@@ -259,6 +306,10 @@ void IRAM_ATTR handleUpInterrupt() {
     return;
   }
 
+  if (!upInputArmed) {
+    return;
+  }
+
   uint32_t now = micros();
 
   if (now - lastUpIsrUs < ISR_DEBOUNCE_US) {
@@ -266,11 +317,16 @@ void IRAM_ATTR handleUpInterrupt() {
   }
 
   lastUpIsrUs = now;
+  upInputArmed = false;
   pushInputEventFromISR(INPUT_UP);
 }
 
 void IRAM_ATTR handleDownInterrupt() {
   if (inputCaptureLocked) {
+    return;
+  }
+
+  if (!downInputArmed) {
     return;
   }
 
@@ -281,7 +337,19 @@ void IRAM_ATTR handleDownInterrupt() {
   }
 
   lastDownIsrUs = now;
+  downInputArmed = false;
   pushInputEventFromISR(INPUT_DOWN);
+}
+
+void IRAM_ATTR handleMenuButtonInterrupt() {
+  uint32_t now = micros();
+
+  if (now - lastMenuIsrUs < ISR_DEBOUNCE_US) {
+    return;
+  }
+
+  lastMenuIsrUs = now;
+  menuButtonPressPending = true;
 }
 
 InputEvent popInputEvent() {
@@ -305,6 +373,78 @@ void clearInputQueue() {
   inputQueueHead = 0;
   inputQueueTail = 0;
   interrupts();
+}
+
+void resetMainInputState() {
+  unsigned long nowMs = millis();
+  uint32_t nowUs = micros();
+
+  noInterrupts();
+  inputQueueHead = 0;
+  inputQueueTail = 0;
+  menuButtonPressPending = false;
+  upInputArmed = true;
+  downInputArmed = true;
+  lastMainIsrUs = nowUs;
+  lastUpIsrUs = nowUs;
+  lastDownIsrUs = nowUs;
+  interrupts();
+
+  upReleasedSinceMs = digitalRead(UP_KEY) == HIGH ? nowMs : 0;
+  downReleasedSinceMs = digitalRead(DOWN_KEY) == HIGH ? nowMs : 0;
+  menuButtonRawDown = isMenuButtonPressed();
+  menuButtonDown = menuButtonRawDown;
+  menuButtonLastChangeMs = nowMs;
+}
+
+void attachMainInputInterrupts() {
+  if (mainInputInterruptsAttached) {
+    return;
+  }
+
+  attachInterrupt(digitalPinToInterrupt(MAIN_TOGGLE_KEY), handleMainToggleInterrupt, FALLING);
+  attachInterrupt(digitalPinToInterrupt(UP_KEY), handleUpInterrupt, FALLING);
+  attachInterrupt(digitalPinToInterrupt(DOWN_KEY), handleDownInterrupt, FALLING);
+  mainInputInterruptsAttached = true;
+}
+
+void detachMainInputInterrupts() {
+  if (!mainInputInterruptsAttached) {
+    return;
+  }
+
+  detachInterrupt(digitalPinToInterrupt(MAIN_TOGGLE_KEY));
+  detachInterrupt(digitalPinToInterrupt(UP_KEY));
+  detachInterrupt(digitalPinToInterrupt(DOWN_KEY));
+  mainInputInterruptsAttached = false;
+}
+
+void updateDirectionalInputArming() {
+  unsigned long now = millis();
+
+  if (digitalRead(UP_KEY) == HIGH) {
+    if (upReleasedSinceMs == 0) {
+      upReleasedSinceMs = now;
+    } else if (now - upReleasedSinceMs >= DIRECTION_REARM_MS) {
+      noInterrupts();
+      upInputArmed = true;
+      interrupts();
+    }
+  } else {
+    upReleasedSinceMs = 0;
+  }
+
+  if (digitalRead(DOWN_KEY) == HIGH) {
+    if (downReleasedSinceMs == 0) {
+      downReleasedSinceMs = now;
+    } else if (now - downReleasedSinceMs >= DIRECTION_REARM_MS) {
+      noInterrupts();
+      downInputArmed = true;
+      interrupts();
+    }
+  } else {
+    downReleasedSinceMs = 0;
+  }
 }
 
 // ---------------- BASIC DRAW HELPERS ----------------
@@ -400,13 +540,22 @@ void drawBar(int x, int y, int w, int h, uint8_t value) {
   }
 }
 
-void drawSelectionMarker(int x, int y, bool selected) {
+void drawActionRow(const char* label, int y, uint8_t value, bool selected) {
   if (selected) {
-    fillRect(x, y, SELECTION_MARKER_SIZE, SELECTION_MARKER_SIZE, BLACK);
+    fillRect(ACTION_MARKER_X, y + 3, ACTION_MARKER_SIZE, ACTION_MARKER_SIZE, BLACK);
   } else {
-    fillRect(x, y, SELECTION_MARKER_SIZE, SELECTION_MARKER_SIZE, WHITE);
-    EPD_DrawRectangle(x, y, x + SELECTION_MARKER_SIZE, y + SELECTION_MARKER_SIZE, BLACK);
+    fillRect(ACTION_MARKER_X, y + 3, ACTION_MARKER_SIZE, ACTION_MARKER_SIZE, WHITE);
+    EPD_DrawRectangle(
+      ACTION_MARKER_X,
+      y + 3,
+      ACTION_MARKER_X + ACTION_MARKER_SIZE,
+      y + 3 + ACTION_MARKER_SIZE,
+      BLACK
+    );
   }
+
+  EPD_ShowString(ACTION_LABEL_X, y, label, BLACK, ACTION_TEXT_SIZE);
+  drawBar(ACTION_BAR_X, y + 4, ACTION_BAR_W, ACTION_BAR_H, value);
 }
 
 void showTextLine(int x, int y, const char* line) {
@@ -467,9 +616,14 @@ void drawWrappedActivityMessage(const char* message) {
   }
 }
 
-void selectActivityMessage(const char* const messages[]) {
+void selectActivityMessage(const char* const messages[], uint8_t count) {
+  if (count == 0) {
+    currentActivityMessage = "";
+    return;
+  }
+
   randomSeed((uint32_t)esp_timer_get_time() ^ (uint32_t)micros());
-  currentActivityMessage = messages[random(ACTIVITY_MESSAGE_COUNT)];
+  currentActivityMessage = messages[random(count)];
 }
 
 void resetPetAgeTimer() {
@@ -557,20 +711,10 @@ void drawHud() {
 
   drawAgeLabel();
 
-  // Pee selector + bar
-  drawSelectionMarker(ACTION_MARKER_X, PEE_Y + 4, selectedAction == ACTION_PEE);
-  EPD_ShowString(ACTION_LABEL_X, PEE_Y, "PEE", BLACK, ACTION_TEXT_SIZE);
-  drawBar(ACTION_BAR_X, PEE_Y + 4, ACTION_BAR_W, ACTION_BAR_H, peeValue);
-
-  // Food selector + bar
-  drawSelectionMarker(ACTION_MARKER_X, FOOD_Y + 4, selectedAction == ACTION_FOOD);
-  EPD_ShowString(ACTION_LABEL_X, FOOD_Y, "FOOD", BLACK, ACTION_TEXT_SIZE);
-  drawBar(ACTION_BAR_X, FOOD_Y + 4, ACTION_BAR_W, ACTION_BAR_H, foodValue);
-
-  // Play selector + bar
-  drawSelectionMarker(ACTION_MARKER_X, PLAY_Y + 4, selectedAction == ACTION_PLAY);
-  EPD_ShowString(ACTION_LABEL_X, PLAY_Y, "PLAY", BLACK, ACTION_TEXT_SIZE);
-  drawBar(ACTION_BAR_X, PLAY_Y + 4, ACTION_BAR_W, ACTION_BAR_H, playValue);
+  drawActionRow("PEE", PEE_Y, peeValue, selectedAction == ACTION_PEE);
+  drawActionRow("FOOD", FOOD_Y, foodValue, selectedAction == ACTION_FOOD);
+  drawActionRow("PLAY", PLAY_Y, playValue, selectedAction == ACTION_PLAY);
+  drawActionRow("PETS", LOVE_Y, loveValue, selectedAction == ACTION_PET);
 }
 
 void drawSelectedTileFrame(int x, int y, int w, int h, bool selected) {
@@ -774,12 +918,170 @@ void drawAnimationFrame(const Animation* anim, const uint8_t* sprite) {
 
 // ---------------- NEED / METER LOGIC ----------------
 
+uint8_t valueForSadNeed(SadNeed need) {
+  if (need == SAD_NEED_PEE) {
+    return peeValue;
+  }
+
+  if (need == SAD_NEED_FOOD) {
+    return foodValue;
+  }
+
+  if (need == SAD_NEED_PLAY) {
+    return playValue;
+  }
+
+  if (need == SAD_NEED_PETS) {
+    return loveValue;
+  }
+
+  return 100;
+}
+
+bool hasSadAnimationForNeed(SadNeed need) {
+  return need == SAD_NEED_PEE || need == SAD_NEED_FOOD || need == SAD_NEED_PLAY || need == SAD_NEED_PETS;
+}
+
+bool isSadNeedLow(SadNeed need) {
+  return hasSadAnimationForNeed(need) && valueForSadNeed(need) < NEED_SAD_THRESHOLD;
+}
+
+SadNeed firstExistingLowNeed() {
+  if (isSadNeedLow(SAD_NEED_PEE)) {
+    return SAD_NEED_PEE;
+  }
+
+  if (isSadNeedLow(SAD_NEED_FOOD)) {
+    return SAD_NEED_FOOD;
+  }
+
+  if (isSadNeedLow(SAD_NEED_PLAY)) {
+    return SAD_NEED_PLAY;
+  }
+
+  if (isSadNeedLow(SAD_NEED_PETS)) {
+    return SAD_NEED_PETS;
+  }
+
+  return SAD_NEED_NONE;
+}
+
+void considerSadNeedCrossing(
+  SadNeed need,
+  uint8_t previousValue,
+  uint32_t drain,
+  SadNeed* bestNeed,
+  uint32_t* bestCrossTick
+) {
+  if (!hasSadAnimationForNeed(need)) {
+    return;
+  }
+
+  if (previousValue < NEED_SAD_THRESHOLD || drain == 0) {
+    return;
+  }
+
+  uint8_t nextValue = previousValue > drain ? previousValue - drain : 0;
+  if (nextValue >= NEED_SAD_THRESHOLD) {
+    return;
+  }
+
+  uint32_t crossTick = previousValue - (NEED_SAD_THRESHOLD - 1);
+  if (crossTick < *bestCrossTick) {
+    *bestCrossTick = crossTick;
+    *bestNeed = need;
+  }
+}
+
+SadNeed firstNeedCrossedByDrain(
+  uint8_t previousPee,
+  uint8_t previousFood,
+  uint8_t previousPlay,
+  uint8_t previousPets,
+  uint32_t drain
+) {
+  SadNeed bestNeed = SAD_NEED_NONE;
+  uint32_t bestCrossTick = UINT32_MAX;
+
+  considerSadNeedCrossing(SAD_NEED_PEE, previousPee, drain, &bestNeed, &bestCrossTick);
+  considerSadNeedCrossing(SAD_NEED_FOOD, previousFood, drain, &bestNeed, &bestCrossTick);
+  considerSadNeedCrossing(SAD_NEED_PLAY, previousPlay, drain, &bestNeed, &bestCrossTick);
+  considerSadNeedCrossing(SAD_NEED_PETS, previousPets, drain, &bestNeed, &bestCrossTick);
+
+  return bestNeed;
+}
+
+void refreshSadNeedAfterNeedChange(SadNeed newlyLowNeed) {
+  if (activeSadNeed != SAD_NEED_NONE && isSadNeedLow(activeSadNeed)) {
+    return;
+  }
+
+  activeSadNeed = SAD_NEED_NONE;
+
+  if (newlyLowNeed != SAD_NEED_NONE && isSadNeedLow(newlyLowNeed)) {
+    activeSadNeed = newlyLowNeed;
+    return;
+  }
+
+  activeSadNeed = firstExistingLowNeed();
+}
+
+const Animation* getIdleAnimationForNeeds() {
+  if (activeSadNeed == SAD_NEED_PEE) {
+    return &sadPeeAnimation;
+  }
+
+  if (activeSadNeed == SAD_NEED_FOOD) {
+    return &sadHungryAnimation;
+  }
+
+  if (activeSadNeed == SAD_NEED_PLAY) {
+    return &sadPlayAnimation;
+  }
+
+  if (activeSadNeed == SAD_NEED_PETS) {
+    return &sadPetAnimation;
+  }
+
+  return &idleAnimation;
+}
+
+bool syncIdleAnimationToNeeds() {
+  if (appMode != APP_TAMAGOTCHI || petMode != PET_IDLE) {
+    return false;
+  }
+
+  if (activeSadNeed == SAD_NEED_NONE && currentAnimation == &sleepingAnimation) {
+    return false;
+  }
+
+  const Animation* targetAnimation = getIdleAnimationForNeeds();
+  if (currentAnimation == targetAnimation) {
+    return false;
+  }
+
+  currentAnimation = targetAnimation;
+  currentFrame = 0;
+  lastFrameMs = millis();
+
+  drawAnimationFrame(
+    currentAnimation,
+    getAnimationFrame(currentAnimation, currentFrame)
+  );
+
+  return true;
+}
+
 void applyNeedDrainTicks(uint32_t ticks) {
   if (ticks == 0) {
     return;
   }
 
-  uint32_t totalDrain = ticks * NEED_DRAIN_AMOUNT;
+  uint8_t previousPee = peeValue;
+  uint8_t previousFood = foodValue;
+  uint8_t previousPlay = playValue;
+  uint8_t previousPets = loveValue;
+  uint32_t totalDrain = ticks;
 
   if (peeValue > totalDrain) {
     peeValue -= totalDrain;
@@ -798,34 +1100,56 @@ void applyNeedDrainTicks(uint32_t ticks) {
   } else {
     playValue = 0;
   }
+
+  if (loveValue > totalDrain) {
+    loveValue -= totalDrain;
+  } else {
+    loveValue = 0;
+  }
+
+  refreshSadNeedAfterNeedChange(
+    firstNeedCrossedByDrain(previousPee, previousFood, previousPlay, previousPets, totalDrain)
+  );
 }
 
-void drainNeedsOverTime() {
-  unsigned long now = millis();
-
-  if (now - lastNeedDrainMs < NEED_DRAIN_INTERVAL_MS) {
+void initNeedDrainClockIfNeeded() {
+  if (lastNeedDrainEpoch >= 100000) {
     return;
   }
 
-  lastNeedDrainMs = now;
+  lastNeedDrainEpoch = (uint32_t)time(NULL);
+  needDrainCarry = 0;
+  rtcPetState.lastNeedDrainEpoch = lastNeedDrainEpoch;
+  rtcPetState.needDrainCarry = needDrainCarry;
+}
 
-  if (peeValue > NEED_DRAIN_AMOUNT) {
-    peeValue -= NEED_DRAIN_AMOUNT;
-  } else {
-    peeValue = 0;
+void resetNeedDrainClock() {
+  lastNeedDrainEpoch = (uint32_t)time(NULL);
+  needDrainCarry = 0;
+  rtcPetState.lastNeedDrainEpoch = lastNeedDrainEpoch;
+  rtcPetState.needDrainCarry = needDrainCarry;
+}
+
+void drainNeedsOverTime() {
+  initNeedDrainClockIfNeeded();
+
+  uint32_t nowEpoch = (uint32_t)time(NULL);
+  if (nowEpoch <= lastNeedDrainEpoch) {
+    return;
   }
 
-  if (foodValue > NEED_DRAIN_AMOUNT) {
-    foodValue -= NEED_DRAIN_AMOUNT;
-  } else {
-    foodValue = 0;
+  uint32_t elapsedSeconds = nowEpoch - lastNeedDrainEpoch;
+  uint64_t drainUnits = (uint64_t)elapsedSeconds * NEED_MAX_VALUE + needDrainCarry;
+  uint32_t ticks = (uint32_t)(drainUnits / NEED_FULL_DRAIN_SECONDS);
+  if (ticks == 0) {
+    return;
   }
 
-  if (playValue > NEED_DRAIN_AMOUNT) {
-    playValue -= NEED_DRAIN_AMOUNT;
-  } else {
-    playValue = 0;
-  }
+  applyNeedDrainTicks(ticks);
+  needDrainCarry = (uint32_t)(drainUnits % NEED_FULL_DRAIN_SECONDS);
+  lastNeedDrainEpoch = nowEpoch;
+  rtcPetState.lastNeedDrainEpoch = lastNeedDrainEpoch;
+  rtcPetState.needDrainCarry = needDrainCarry;
 }
 
 // ---------------- PET STATE / SLEEP ----------------
@@ -943,9 +1267,13 @@ void initDefaultPetState() {
   peeValue = 100;
   foodValue = 100;
   playValue = 100;
+  loveValue = 100;
+  activeSadNeed = SAD_NEED_NONE;
   selectedAction = ACTION_PEE;
   appMode = APP_HOME;
   homeSelection = HOME_OPTION_TAMAGOTCHI;
+  lastNeedDrainEpoch = 0;
+  needDrainCarry = 0;
   resetPetAgeTimer();
 }
 
@@ -956,12 +1284,19 @@ void savePetStateToRtc() {
   rtcPetState.peeValue = peeValue;
   rtcPetState.foodValue = foodValue;
   rtcPetState.playValue = playValue;
+  rtcPetState.loveValue = loveValue;
+  rtcPetState.activeSadNeed = (uint8_t)activeSadNeed;
   rtcPetState.selectedAction = selectedAction;
   rtcPetState.appMode = (uint8_t)appMode;
   rtcPetState.homeSelection = (uint8_t)homeSelection;
   rtcPetState.petAgeStarted = petAgeStarted ? 1 : 0;
   rtcPetState.petBirthEpoch = petBirthEpoch;
-  rtcPetState.sleepEntryUs = esp_timer_get_time();
+  rtcPetState.sleepEntryEpoch = rtcPetState.epochSeconds;
+  if (lastNeedDrainEpoch < 100000) {
+    lastNeedDrainEpoch = rtcPetState.epochSeconds;
+  }
+  rtcPetState.lastNeedDrainEpoch = lastNeedDrainEpoch;
+  rtcPetState.needDrainCarry = needDrainCarry;
 }
 
 bool restorePetStateFromRtc() {
@@ -972,11 +1307,15 @@ bool restorePetStateFromRtc() {
   peeValue = rtcPetState.peeValue;
   foodValue = rtcPetState.foodValue;
   playValue = rtcPetState.playValue;
+  loveValue = rtcPetState.loveValue;
+  activeSadNeed = (SadNeed)rtcPetState.activeSadNeed;
   selectedAction = (SelectedAction)rtcPetState.selectedAction;
   appMode = (AppMode)rtcPetState.appMode;
   homeSelection = (HomeOption)rtcPetState.homeSelection;
   petAgeStarted = rtcPetState.petAgeStarted != 0;
   petBirthEpoch = rtcPetState.petBirthEpoch;
+  lastNeedDrainEpoch = rtcPetState.lastNeedDrainEpoch;
+  needDrainCarry = rtcPetState.needDrainCarry;
 
   if (appMode > APP_EREADER) {
     appMode = APP_TAMAGOTCHI;
@@ -986,20 +1325,35 @@ bool restorePetStateFromRtc() {
     homeSelection = HOME_OPTION_TAMAGOTCHI;
   }
 
+  if (selectedAction > ACTION_PET) {
+    selectedAction = ACTION_PEE;
+  }
+
+  if (activeSadNeed > SAD_NEED_PETS) {
+    activeSadNeed = SAD_NEED_NONE;
+  }
+
+  refreshSadNeedAfterNeedChange(SAD_NEED_NONE);
+
   return true;
 }
 
 void applyNeedsSinceSleep() {
-  uint64_t nowUs = esp_timer_get_time();
+  uint32_t previousDrainEpoch = lastNeedDrainEpoch;
+  uint32_t nowEpoch = (uint32_t)time(NULL);
 
-  if (nowUs < rtcPetState.sleepEntryUs) {
-    Serial.println("Skipping sleep need drain: timer reset during deep sleep");
+  if (previousDrainEpoch < 100000 || nowEpoch <= previousDrainEpoch) {
+    Serial.println("Skipping sleep need drain: no elapsed clock time");
     return;
   }
 
-  uint64_t elapsedUs = nowUs - rtcPetState.sleepEntryUs;
-  uint32_t ticks = elapsedUs / ((uint64_t)NEED_DRAIN_INTERVAL_MS * 1000ULL);
-  applyNeedDrainTicks(ticks);
+  drainNeedsOverTime();
+
+  Serial.printf(
+    "Applied sleep need drain: elapsed=%lu seconds ticks=%lu\n",
+    (unsigned long)(nowEpoch - previousDrainEpoch),
+    (unsigned long)(((nowEpoch - previousDrainEpoch) * NEED_MAX_VALUE) / NEED_FULL_DRAIN_SECONDS)
+  );
 }
 
 bool allButtonsReleased() {
@@ -1047,11 +1401,15 @@ void enterHomeScreen() {
     ereaderLeave();
   }
 
+  attachMainInputInterrupts();
+  resetMainInputState();
   appMode = APP_HOME;
   petMode = PET_IDLE;
   activeAction = ACTIVE_NONE;
   currentActivityMessage = "";
-  clearInputQueue();
+  inputCaptureLocked = false;
+  inputLockoutUntil = 0;
+  discardWakeInput = false;
   lastActivityMs = millis();
   showHomeScreenFull();
 }
@@ -1060,9 +1418,11 @@ void enterTamagotchi() {
   Serial.println("Entering tamagotchi");
 
   startPetAgeTimerIfNeeded();
+  attachMainInputInterrupts();
+  resetMainInputState();
   appMode = APP_TAMAGOTCHI;
   forceFullRefreshNextFrame = true;
-  clearInputQueue();
+  discardWakeInput = false;
   startIdle();
   lastActivityMs = millis();
 }
@@ -1070,14 +1430,17 @@ void enterTamagotchi() {
 void enterEreaderMode() {
   Serial.println("Entering ereader");
 
+  detachMainInputInterrupts();
+  resetMainInputState();
   appMode = APP_EREADER;
-  clearInputQueue();
+  discardWakeInput = false;
   lastActivityMs = millis();
   ereaderEnter();
 }
 
 void startIdle() {
-  currentAnimation = &idleAnimation;
+  refreshSadNeedAfterNeedChange(SAD_NEED_NONE);
+  currentAnimation = getIdleAnimationForNeeds();
   currentFrame = 0;
   petMode = PET_IDLE;
   activeAction = ACTIVE_NONE;
@@ -1114,7 +1477,8 @@ void returnToIdleFromDrowsy() {
     return;
   }
 
-  currentAnimation = &idleAnimation;
+  refreshSadNeedAfterNeedChange(SAD_NEED_NONE);
+  currentAnimation = getIdleAnimationForNeeds();
   currentFrame = 0;
   lastFrameMs = millis();
 
@@ -1129,7 +1493,7 @@ void startEating() {
   currentFrame = 0;
   petMode = PET_ACTION;
   activeAction = ACTIVE_FOOD;
-  selectActivityMessage(eatActivityMessages);
+  selectActivityMessage(eatActivityMessages, EAT_ACTIVITY_MESSAGE_COUNT);
   lastFrameMs = millis();
 
   Serial.println("Eating animation started");
@@ -1145,10 +1509,26 @@ void startPlaying() {
   currentFrame = 0;
   petMode = PET_ACTION;
   activeAction = ACTIVE_PLAY;
-  selectActivityMessage(playActivityMessages);
+  selectActivityMessage(playActivityMessages, PLAY_ACTIVITY_MESSAGE_COUNT);
   lastFrameMs = millis();
 
   Serial.println("Play animation started");
+
+  drawAnimationFrame(
+    currentAnimation,
+    getAnimationFrame(currentAnimation, currentFrame)
+  );
+}
+
+void startPetting() {
+  currentAnimation = &pettingAnimation;
+  currentFrame = 0;
+  petMode = PET_ACTION;
+  activeAction = ACTIVE_PET;
+  selectActivityMessage(petActivityMessages, PET_ACTIVITY_MESSAGE_COUNT);
+  lastFrameMs = millis();
+
+  Serial.println("Petting animation started");
 
   drawAnimationFrame(
     currentAnimation,
@@ -1161,7 +1541,7 @@ void startPeeing() {
   currentFrame = 0;
   petMode = PET_ACTION;
   activeAction = ACTIVE_PEE;
-  selectActivityMessage(peeActivityMessages);
+  selectActivityMessage(peeActivityMessages, PEE_ACTIVITY_MESSAGE_COUNT);
   lastFrameMs = millis();
 
   Serial.println("Peeing animation started");
@@ -1183,13 +1563,17 @@ void startSelectedAction() {
     startPeeing();
   } else if (selectedAction == ACTION_FOOD) {
     startEating();
-  } else {
+  } else if (selectedAction == ACTION_PLAY) {
     startPlaying();
+  } else {
+    startPetting();
   }
 }
 
 void finishActionAndReturnToIdle() {
   Serial.println("Action finished, returning to idle");
+
+  drainNeedsOverTime();
 
   if (activeAction == ACTIVE_PEE) {
     peeValue = 100;
@@ -1203,7 +1587,12 @@ void finishActionAndReturnToIdle() {
     playValue = 100;
   }
 
-  currentAnimation = &idleAnimation;
+  if (activeAction == ACTIVE_PET) {
+    loveValue = 100;
+  }
+
+  refreshSadNeedAfterNeedChange(SAD_NEED_NONE);
+  currentAnimation = getIdleAnimationForNeeds();
   currentFrame = 0;
   petMode = PET_IDLE;
   activeAction = ACTIVE_NONE;
@@ -1253,14 +1642,24 @@ void advanceActionAnimation() {
 }
 
 void moveSelectionUp() {
-  if (selectedAction == ACTION_PLAY) {
+  if (selectedAction == ACTION_PET) {
+    selectedAction = ACTION_PLAY;
+  } else if (selectedAction == ACTION_PLAY) {
     selectedAction = ACTION_FOOD;
   } else if (selectedAction == ACTION_FOOD) {
     selectedAction = ACTION_PEE;
   }
 
   Serial.print("Selected: ");
-  Serial.println(selectedAction == ACTION_PEE ? "Pee" : "Food");
+  if (selectedAction == ACTION_PEE) {
+    Serial.println("Pee");
+  } else if (selectedAction == ACTION_FOOD) {
+    Serial.println("Food");
+  } else if (selectedAction == ACTION_PLAY) {
+    Serial.println("Play");
+  } else {
+    Serial.println("Pets");
+  }
 
   drawAnimationFrame(
     currentAnimation,
@@ -1275,6 +1674,8 @@ void moveSelectionDown() {
     selectedAction = ACTION_FOOD;
   } else if (selectedAction == ACTION_FOOD) {
     selectedAction = ACTION_PLAY;
+  } else if (selectedAction == ACTION_PLAY) {
+    selectedAction = ACTION_PET;
   }
 
   Serial.print("Selected: ");
@@ -1282,8 +1683,10 @@ void moveSelectionDown() {
     Serial.println("Pee");
   } else if (selectedAction == ACTION_FOOD) {
     Serial.println("Food");
-  } else {
+  } else if (selectedAction == ACTION_PLAY) {
     Serial.println("Play");
+  } else {
+    Serial.println("Pets");
   }
 
   drawAnimationFrame(
@@ -1314,19 +1717,6 @@ void moveHomeSelectionDown() {
   lastActivityMs = millis();
 }
 
-void onMainToggleHold() {
-  lastActivityMs = millis();
-
-  if (appMode == APP_TAMAGOTCHI) {
-    enterHomeScreen();
-    return;
-  }
-
-  if (appMode == APP_EREADER) {
-    enterHomeScreen();
-  }
-}
-
 void onMainToggleTap() {
   lastActivityMs = millis();
 
@@ -1348,34 +1738,61 @@ void onMainToggleTap() {
   }
 }
 
-bool isMainTogglePressed() {
-  return digitalRead(MAIN_TOGGLE_KEY) == LOW;
+bool isMenuButtonPressed() {
+  return digitalRead(MENU_BUTTON_KEY) == LOW;
 }
 
-void updateMainToggleInput() {
-  bool pressed = isMainTogglePressed();
+bool canMenuButtonEnterHome() {
+  if (appMode == APP_HOME) {
+    return false;
+  }
+
+  return !(appMode == APP_TAMAGOTCHI && petMode == PET_ACTION);
+}
+
+void updateMenuButtonInput() {
+  bool pendingPress = false;
+  noInterrupts();
+  if (menuButtonPressPending) {
+    menuButtonPressPending = false;
+    pendingPress = true;
+  }
+  interrupts();
+
+  if (pendingPress) {
+    lastActivityMs = millis();
+    menuButtonRawDown = isMenuButtonPressed();
+    menuButtonDown = menuButtonRawDown;
+    menuButtonLastChangeMs = millis();
+    if (canMenuButtonEnterHome()) {
+      enterHomeScreen();
+      return;
+    }
+  }
+
+  bool rawDown = isMenuButtonPressed();
   unsigned long now = millis();
 
-  if (pressed && !mainToggleDown) {
-    mainToggleDown = true;
-    mainToggleDownMs = now;
-    mainToggleHoldHandled = false;
+  if (rawDown != menuButtonRawDown) {
+    menuButtonRawDown = rawDown;
+    menuButtonLastChangeMs = now;
   }
 
-  if (pressed && mainToggleDown && !mainToggleHoldHandled) {
-    if (now - mainToggleDownMs >= MAIN_TOGGLE_HOLD_MS) {
-      mainToggleHoldHandled = true;
-      onMainToggleHold();
-    }
+  if (now - menuButtonLastChangeMs < MENU_BUTTON_DEBOUNCE_MS) {
+    return;
   }
 
-  if (!pressed && mainToggleDown) {
-    if (!mainToggleHoldHandled) {
-      onMainToggleTap();
-    }
+  if (rawDown == menuButtonDown) {
+    return;
+  }
 
-    mainToggleDown = false;
-    mainToggleHoldHandled = false;
+  menuButtonDown = rawDown;
+
+  if (menuButtonDown) {
+    lastActivityMs = millis();
+    if (canMenuButtonEnterHome()) {
+      enterHomeScreen();
+    }
   }
 }
 
@@ -1389,7 +1806,7 @@ void processInputEvent(InputEvent event) {
   lastActivityMs = millis();
 
   if (event == INPUT_MAIN) {
-    // Main toggle is handled via hold/tap polling.
+    onMainToggleTap();
     return;
   }
 
@@ -1453,14 +1870,14 @@ void setup() {
 
   clearInputQueue();
 
-  attachInterrupt(digitalPinToInterrupt(MAIN_TOGGLE_KEY), handleMainToggleInterrupt, FALLING);
-  attachInterrupt(digitalPinToInterrupt(UP_KEY), handleUpInterrupt, FALLING);
-  attachInterrupt(digitalPinToInterrupt(DOWN_KEY), handleDownInterrupt, FALLING);
+  attachInterrupt(digitalPinToInterrupt(MENU_BUTTON_KEY), handleMenuButtonInterrupt, FALLING);
+  attachMainInputInterrupts();
+  resetMainInputState();
 
   Serial.println("AdventureCattoEink");
   Serial.println("Interrupt input enabled");
   Serial.println("Main toggle tap: select action / enter mode");
-  Serial.println("Main toggle hold (3s): exit to home screen");
+  Serial.println("Menu button tap: exit to home screen");
   Serial.println("Up/down: select pee, food, play, or home menu");
   Serial.println("Inputs are queued immediately on button press");
   Serial.println("Input capture locks during actions to prevent duplicate actions");
@@ -1475,7 +1892,6 @@ void setup() {
     clearInputQueue();
 
     if (restorePetStateFromRtc()) {
-      applyNeedsSinceSleep();
       restoredFromRtc = true;
     } else {
       initDefaultPetState();
@@ -1485,6 +1901,10 @@ void setup() {
   }
 
   initDeviceTime(restoredFromRtc);
+
+  if (wakeCause == ESP_SLEEP_WAKEUP_EXT1 && restoredFromRtc) {
+    applyNeedsSinceSleep();
+  }
 
   if (appMode == APP_HOME) {
     showHomeScreenFull();
@@ -1501,6 +1921,7 @@ void setup() {
 
 void loop() {
   unsigned long now = millis();
+  updateDirectionalInputArming();
 
   if (appMode == APP_HOME) {
     drainNeedsOverTime();
@@ -1518,11 +1939,7 @@ void loop() {
       return;
     }
 
-    updateMainToggleInput();
-    if (appMode != APP_HOME) {
-      delay(5);
-      return;
-    }
+    updateMenuButtonInput();
 
     InputEvent event = popInputEvent();
     if (event != INPUT_NONE) {
@@ -1560,7 +1977,7 @@ void loop() {
       return;
     }
 
-    updateMainToggleInput();
+    updateMenuButtonInput();
     if (appMode != APP_EREADER) {
       delay(5);
       return;
@@ -1575,6 +1992,12 @@ void loop() {
       return;
     }
 
+    delay(5);
+    return;
+  }
+
+  updateMenuButtonInput();
+  if (appMode != APP_TAMAGOTCHI) {
     delay(5);
     return;
   }
@@ -1603,8 +2026,9 @@ void loop() {
 
     if (petMode == PET_IDLE) {
       drainNeedsOverTime();
+      bool animationChanged = syncIdleAnimationToNeeds();
 
-      if (now - lastFrameMs >= currentAnimation->frameHoldMs) {
+      if (!animationChanged && now - lastFrameMs >= currentAnimation->frameHoldMs) {
         lastFrameMs = now;
         advanceIdleAnimation();
       }
@@ -1629,16 +2053,10 @@ void loop() {
     return;
   }
 
-  updateMainToggleInput();
-
-  if (appMode != APP_TAMAGOTCHI) {
-    delay(5);
-    return;
-  }
-
   // Idle state: idle loops and needs drain.
   if (petMode == PET_IDLE) {
     drainNeedsOverTime();
+    bool animationChanged = syncIdleAnimationToNeeds();
 
     unsigned long inactiveMs = now - lastActivityMs;
 
@@ -1647,7 +2065,7 @@ void loop() {
       return;
     }
 
-    if (inactiveMs >= SLEEP_ANIMATION_TIMEOUT_MS) {
+    if (inactiveMs >= SLEEP_ANIMATION_TIMEOUT_MS && activeSadNeed == SAD_NEED_NONE) {
       if (currentAnimation != &sleepingAnimation) {
         startDrowsySleeping();
       }
@@ -1655,7 +2073,7 @@ void loop() {
       returnToIdleFromDrowsy();
     }
 
-    if (now - lastFrameMs >= currentAnimation->frameHoldMs) {
+    if (!animationChanged && now - lastFrameMs >= currentAnimation->frameHoldMs) {
       lastFrameMs = now;
       advanceIdleAnimation();
     }

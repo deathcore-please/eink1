@@ -26,19 +26,23 @@ const ButtonManager::ButtonState& ButtonManager::state(ButtonId id) const {
 }
 
 void ButtonManager::begin() {
+  unsigned long now = millis();
+
   for (uint8_t i = 0; i < static_cast<uint8_t>(ButtonId::Count); ++i) {
     ButtonId id = static_cast<ButtonId>(i);
     ButtonState& st = states[i];
     st.pin = pinFor(id);
     st.enabled = true;
-    st.rawDown = false;
-    st.lastDown = false;
-    st.pressedAt = 0;
-    st.lastChangeAt = 0;
-    st.longFired = false;
     st.shortPress = false;
     st.longPress = false;
     pinMode(st.pin, Config::BUTTON_PULLUP ? INPUT_PULLUP : INPUT);
+
+    bool rawDown = (digitalRead(st.pin) == LOW);
+    st.rawDown = rawDown;
+    st.lastDown = rawDown;
+    st.pressedAt = rawDown ? now : 0;
+    st.lastChangeAt = now;
+    st.longFired = rawDown;
   }
 }
 

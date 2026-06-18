@@ -33,6 +33,7 @@ void uiInit(EpdDisplay& display);
 const UiLayout& uiLayout();
 const UiLayout& uiReaderLayout();
 
+size_t uiMeasureReaderBytes(EpdDisplay& display, const String& text);
 void uiDrawReader(EpdDisplay& display, const ReaderView& view, bool partial);
 void uiDrawLibrary(EpdDisplay& display, const std::vector<BookInfo>& books, int selectedIndex, int scrollIndex);
 void uiDrawInfo(EpdDisplay& display, const StorageStats& stats, float battV, int battPercent);

@@ -95,11 +95,72 @@ const UiLayout& uiReaderLayout() {
   return readerLayout;
 }
 
-void uiDrawReader(EpdDisplay& display, const ReaderView& view, bool partial) {
-  const UiLayout& r = readerLayout;
+static void prepareReaderTextMetrics(EpdDisplay& display) {
   display.setTextSize(Config::READER_TEXT_SIZE);
   display.setFont(&FreeSerif9pt8b);
   display.setTextWrap(false);
+}
+
+size_t uiMeasureReaderBytes(EpdDisplay& display, const String& text) {
+  const UiLayout& r = readerLayout;
+  prepareReaderTextMetrics(display);
+
+  size_t bytesRendered = 0;
+  const size_t textLen = text.length();
+  size_t charPos = 0;
+  int16_t visualLineIndex = 0;
+
+  while (charPos < textLen && visualLineIndex < r.maxLines) {
+    String lineText = "";
+
+    while (charPos < textLen) {
+      while (charPos < textLen && (text[charPos] == ' ' || text[charPos] == '\t' || text[charPos] == '\r')) {
+        charPos++;
+        bytesRendered = charPos;
+      }
+
+      if (charPos >= textLen) {
+        break;
+      }
+
+      if (text[charPos] == '\n') {
+        charPos++;
+        bytesRendered = charPos;
+        break;
+      }
+
+      size_t wordEnd = charPos;
+      while (wordEnd < textLen && text[wordEnd] != ' ' && text[wordEnd] != '\t' && text[wordEnd] != '\n' && text[wordEnd] != '\r') {
+        wordEnd++;
+      }
+
+      String word = text.substring(charPos, wordEnd);
+      String candidateLine = lineText.isEmpty() ? word : lineText + " " + word;
+      int16_t x1 = 0, y1 = 0;
+      uint16_t w = 0, h = 0;
+      display.getTextBounds(candidateLine.c_str(), 0, 0, &x1, &y1, &w, &h);
+
+      if (static_cast<int16_t>(w) > r.contentW && !lineText.isEmpty()) {
+        break;
+      }
+
+      lineText = candidateLine;
+      charPos = wordEnd;
+      bytesRendered = charPos;
+    }
+
+    visualLineIndex++;
+  }
+
+  display.setTextSize(Config::UI_TEXT_SIZE);
+  display.setFont(nullptr);
+  display.setTextWrap(true);
+  return bytesRendered;
+}
+
+void uiDrawReader(EpdDisplay& display, const ReaderView& view, bool partial) {
+  const UiLayout& r = readerLayout;
+  prepareReaderTextMetrics(display);
   
   int16_t sampleX1 = 0;
   int16_t sampleY1 = 0;
@@ -138,6 +199,7 @@ void uiDrawReader(EpdDisplay& display, const ReaderView& view, bool partial) {
         // Skip spaces, tabs, and carriage returns
         while (charPos < textLen && (view.text[charPos] == ' ' || view.text[charPos] == '\t' || view.text[charPos] == '\r')) {
           charPos++;
+          bytesRendered = charPos;
         }
 
         if (charPos >= textLen) break;
