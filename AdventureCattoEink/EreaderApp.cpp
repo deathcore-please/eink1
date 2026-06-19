@@ -721,7 +721,7 @@ void ereaderLeave() {
     saveNavigationState();
   }
   saveEreaderResumeScreen(screen);
-  display.powerOff();
+  display.hibernate();
 }
 
 bool ereaderWantsSleep() {
