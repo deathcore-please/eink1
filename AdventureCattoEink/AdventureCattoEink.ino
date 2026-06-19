@@ -62,7 +62,11 @@ extern uint8_t ImageBW[ALLSCREEN_BYTES];
 #define DIRECTION_REARM_MS 70
 
 // Need/meter settings
-#define NEED_FULL_DRAIN_SECONDS (3UL * 60UL)
+// Time for a full (100 -> 0) bar to drain, per need.
+#define PEE_FULL_DRAIN_SECONDS  (6UL * 3600UL)
+#define FOOD_FULL_DRAIN_SECONDS (4UL * 3600UL)
+#define PLAY_FULL_DRAIN_SECONDS (6UL * 3600UL)
+#define PET_FULL_DRAIN_SECONDS  (2UL * 3600UL)
 #define NEED_MAX_VALUE 100UL
 #define NEED_SAD_THRESHOLD 10
 
@@ -70,7 +74,7 @@ extern uint8_t ImageBW[ALLSCREEN_BYTES];
 #define SLEEP_ANIMATION_TIMEOUT_MS 15000
 #define INACTIVITY_TIMEOUT_MS 30000
 #define MENU_BUTTON_DEBOUNCE_MS 30
-#define RTC_PET_STATE_MAGIC 0xCA77000AUL
+#define RTC_PET_STATE_MAGIC 0xCA77000BUL
 #define WAKE_BUTTON_PIN_MASK ((1ULL << EXIT_KEY) | (1ULL << HOME_KEY) | (1ULL << NEXT_KEY) | (1ULL << OK_KEY) | (1ULL << PRV_KEY))
 
 // Local hour offset from UTC (seconds). Adjust for your timezone.
@@ -201,7 +205,10 @@ RTC_DATA_ATTR struct {
   uint32_t petBirthEpoch;
   uint32_t sleepEntryEpoch;
   uint32_t lastNeedDrainEpoch;
-  uint32_t needDrainCarry;
+  uint32_t peeDrainCarry;
+  uint32_t foodDrainCarry;
+  uint32_t playDrainCarry;
+  uint32_t loveDrainCarry;
 } rtcPetState;
 
 // These ones actually change over time
@@ -212,7 +219,10 @@ uint8_t loveValue = 100;
 bool petAgeStarted = false;
 uint32_t petBirthEpoch = 0;
 uint32_t lastNeedDrainEpoch = 0;
-uint32_t needDrainCarry = 0;
+uint32_t peeDrainCarry = 0;
+uint32_t foodDrainCarry = 0;
+uint32_t playDrainCarry = 0;
+uint32_t loveDrainCarry = 0;
 
 #define PEE_ACTIVITY_MESSAGE_COUNT 4
 #define PLAY_ACTIVITY_MESSAGE_COUNT 4
@@ -653,35 +663,84 @@ void startPetAgeTimerIfNeeded() {
   refreshRtcEpochFromClock();
 }
 
-uint32_t getPetAgeDays() {
+uint8_t daysInMonth(int month, int year) {
+  static const uint8_t lengths[12] = {31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31};
+  if (month < 0 || month > 11) {
+    return 30;
+  }
+  if (month == 1) {
+    bool leap = (year % 4 == 0 && year % 100 != 0) || (year % 400 == 0);
+    return leap ? 29 : 28;
+  }
+  return lengths[month];
+}
+
+void computePetAge(uint32_t& years, uint32_t& months, uint32_t& days) {
+  years = 0;
+  months = 0;
+  days = 0;
+
   if (!petAgeStarted || petBirthEpoch == 0) {
-    return 0;
+    return;
   }
 
   uint32_t nowEpoch = (uint32_t)time(NULL);
   if (nowEpoch <= petBirthEpoch) {
-    return 0;
+    return;
   }
 
-  return (nowEpoch - petBirthEpoch) / 86400UL;
+  time_t birthLocal = (time_t)petBirthEpoch + TIMEZONE_OFFSET_SEC;
+  time_t nowLocal = (time_t)nowEpoch + TIMEZONE_OFFSET_SEC;
+  struct tm birth;
+  struct tm now;
+  gmtime_r(&birthLocal, &birth);
+  gmtime_r(&nowLocal, &now);
+
+  int y = now.tm_year - birth.tm_year;
+  int mo = now.tm_mon - birth.tm_mon;
+  int d = now.tm_mday - birth.tm_mday;
+
+  if (d < 0) {
+    int pm = now.tm_mon - 1;
+    int py = now.tm_year + 1900;
+    if (pm < 0) {
+      pm = 11;
+      py--;
+    }
+    d += daysInMonth(pm, py);
+    mo--;
+  }
+  if (mo < 0) {
+    mo += 12;
+    y--;
+  }
+  if (y < 0) {
+    y = 0;
+    mo = 0;
+    d = 0;
+  }
+
+  years = (uint32_t)y;
+  months = (uint32_t)mo;
+  days = (uint32_t)d;
 }
 
 void formatPetAgeLabel(char* out, size_t outSize) {
-  uint32_t days = getPetAgeDays();
+  uint32_t years = 0;
+  uint32_t months = 0;
+  uint32_t days = 0;
+  computePetAge(years, months, days);
 
-  if (days < 30) {
+  if (years == 0 && months == 0) {
     snprintf(out, outSize, "%lu %s", (unsigned long)days, days == 1 ? "Day" : "Days");
     return;
   }
 
-  if (days < 365) {
-    uint32_t months = days / 30;
+  if (years == 0) {
     snprintf(out, outSize, "%lu %s", (unsigned long)months, months == 1 ? "Month" : "Months");
     return;
   }
 
-  uint32_t years = days / 365;
-  uint32_t months = (days % 365) / 30;
   snprintf(
     out,
     outSize,
@@ -977,8 +1036,9 @@ void considerSadNeedCrossing(
   SadNeed need,
   uint8_t previousValue,
   uint32_t drain,
+  uint32_t fullDrainSeconds,
   SadNeed* bestNeed,
-  uint32_t* bestCrossTick
+  uint64_t* bestCrossKey
 ) {
   if (!hasSadAnimationForNeed(need)) {
     return;
@@ -993,9 +1053,13 @@ void considerSadNeedCrossing(
     return;
   }
 
-  uint32_t crossTick = previousValue - (NEED_SAD_THRESHOLD - 1);
-  if (crossTick < *bestCrossTick) {
-    *bestCrossTick = crossTick;
+  // Rank by approximate time-to-cross so the need that actually hit the
+  // threshold first (in wall-clock terms) wins, even with different rates.
+  // seconds-per-point is fullDrainSeconds/100; the common /100 is dropped.
+  uint32_t pointsToCross = previousValue - (NEED_SAD_THRESHOLD - 1);
+  uint64_t crossKey = (uint64_t)pointsToCross * fullDrainSeconds;
+  if (crossKey < *bestCrossKey) {
+    *bestCrossKey = crossKey;
     *bestNeed = need;
   }
 }
@@ -1005,15 +1069,18 @@ SadNeed firstNeedCrossedByDrain(
   uint8_t previousFood,
   uint8_t previousPlay,
   uint8_t previousPets,
-  uint32_t drain
+  uint32_t peeTicks,
+  uint32_t foodTicks,
+  uint32_t playTicks,
+  uint32_t loveTicks
 ) {
   SadNeed bestNeed = SAD_NEED_NONE;
-  uint32_t bestCrossTick = UINT32_MAX;
+  uint64_t bestCrossKey = UINT64_MAX;
 
-  considerSadNeedCrossing(SAD_NEED_PEE, previousPee, drain, &bestNeed, &bestCrossTick);
-  considerSadNeedCrossing(SAD_NEED_FOOD, previousFood, drain, &bestNeed, &bestCrossTick);
-  considerSadNeedCrossing(SAD_NEED_PLAY, previousPlay, drain, &bestNeed, &bestCrossTick);
-  considerSadNeedCrossing(SAD_NEED_PETS, previousPets, drain, &bestNeed, &bestCrossTick);
+  considerSadNeedCrossing(SAD_NEED_PEE, previousPee, peeTicks, PEE_FULL_DRAIN_SECONDS, &bestNeed, &bestCrossKey);
+  considerSadNeedCrossing(SAD_NEED_FOOD, previousFood, foodTicks, FOOD_FULL_DRAIN_SECONDS, &bestNeed, &bestCrossKey);
+  considerSadNeedCrossing(SAD_NEED_PLAY, previousPlay, playTicks, PLAY_FULL_DRAIN_SECONDS, &bestNeed, &bestCrossKey);
+  considerSadNeedCrossing(SAD_NEED_PETS, previousPets, loveTicks, PET_FULL_DRAIN_SECONDS, &bestNeed, &bestCrossKey);
 
   return bestNeed;
 }
@@ -1079,8 +1146,15 @@ bool syncIdleAnimationToNeeds() {
   return true;
 }
 
-void applyNeedDrainTicks(uint32_t ticks) {
-  if (ticks == 0) {
+uint32_t computeNeedTicks(uint32_t elapsedSeconds, uint32_t fullDrainSeconds, uint32_t& carry) {
+  uint64_t units = (uint64_t)elapsedSeconds * NEED_MAX_VALUE + carry;
+  uint32_t ticks = (uint32_t)(units / fullDrainSeconds);
+  carry = (uint32_t)(units % fullDrainSeconds);
+  return ticks;
+}
+
+void applyNeedDrainTicks(uint32_t peeTicks, uint32_t foodTicks, uint32_t playTicks, uint32_t loveTicks) {
+  if (peeTicks == 0 && foodTicks == 0 && playTicks == 0 && loveTicks == 0) {
     return;
   }
 
@@ -1088,34 +1162,17 @@ void applyNeedDrainTicks(uint32_t ticks) {
   uint8_t previousFood = foodValue;
   uint8_t previousPlay = playValue;
   uint8_t previousPets = loveValue;
-  uint32_t totalDrain = ticks;
 
-  if (peeValue > totalDrain) {
-    peeValue -= totalDrain;
-  } else {
-    peeValue = 0;
-  }
-
-  if (foodValue > totalDrain) {
-    foodValue -= totalDrain;
-  } else {
-    foodValue = 0;
-  }
-
-  if (playValue > totalDrain) {
-    playValue -= totalDrain;
-  } else {
-    playValue = 0;
-  }
-
-  if (loveValue > totalDrain) {
-    loveValue -= totalDrain;
-  } else {
-    loveValue = 0;
-  }
+  peeValue = peeValue > peeTicks ? peeValue - peeTicks : 0;
+  foodValue = foodValue > foodTicks ? foodValue - foodTicks : 0;
+  playValue = playValue > playTicks ? playValue - playTicks : 0;
+  loveValue = loveValue > loveTicks ? loveValue - loveTicks : 0;
 
   refreshSadNeedAfterNeedChange(
-    firstNeedCrossedByDrain(previousPee, previousFood, previousPlay, previousPets, totalDrain)
+    firstNeedCrossedByDrain(
+      previousPee, previousFood, previousPlay, previousPets,
+      peeTicks, foodTicks, playTicks, loveTicks
+    )
   );
 }
 
@@ -1125,16 +1182,28 @@ void initNeedDrainClockIfNeeded() {
   }
 
   lastNeedDrainEpoch = (uint32_t)time(NULL);
-  needDrainCarry = 0;
+  peeDrainCarry = 0;
+  foodDrainCarry = 0;
+  playDrainCarry = 0;
+  loveDrainCarry = 0;
   rtcPetState.lastNeedDrainEpoch = lastNeedDrainEpoch;
-  rtcPetState.needDrainCarry = needDrainCarry;
+  rtcPetState.peeDrainCarry = peeDrainCarry;
+  rtcPetState.foodDrainCarry = foodDrainCarry;
+  rtcPetState.playDrainCarry = playDrainCarry;
+  rtcPetState.loveDrainCarry = loveDrainCarry;
 }
 
 void resetNeedDrainClock() {
   lastNeedDrainEpoch = (uint32_t)time(NULL);
-  needDrainCarry = 0;
+  peeDrainCarry = 0;
+  foodDrainCarry = 0;
+  playDrainCarry = 0;
+  loveDrainCarry = 0;
   rtcPetState.lastNeedDrainEpoch = lastNeedDrainEpoch;
-  rtcPetState.needDrainCarry = needDrainCarry;
+  rtcPetState.peeDrainCarry = peeDrainCarry;
+  rtcPetState.foodDrainCarry = foodDrainCarry;
+  rtcPetState.playDrainCarry = playDrainCarry;
+  rtcPetState.loveDrainCarry = loveDrainCarry;
 }
 
 void drainNeedsOverTime() {
@@ -1146,17 +1215,21 @@ void drainNeedsOverTime() {
   }
 
   uint32_t elapsedSeconds = nowEpoch - lastNeedDrainEpoch;
-  uint64_t drainUnits = (uint64_t)elapsedSeconds * NEED_MAX_VALUE + needDrainCarry;
-  uint32_t ticks = (uint32_t)(drainUnits / NEED_FULL_DRAIN_SECONDS);
-  if (ticks == 0) {
-    return;
-  }
+  uint32_t peeTicks = computeNeedTicks(elapsedSeconds, PEE_FULL_DRAIN_SECONDS, peeDrainCarry);
+  uint32_t foodTicks = computeNeedTicks(elapsedSeconds, FOOD_FULL_DRAIN_SECONDS, foodDrainCarry);
+  uint32_t playTicks = computeNeedTicks(elapsedSeconds, PLAY_FULL_DRAIN_SECONDS, playDrainCarry);
+  uint32_t loveTicks = computeNeedTicks(elapsedSeconds, PET_FULL_DRAIN_SECONDS, loveDrainCarry);
 
-  applyNeedDrainTicks(ticks);
-  needDrainCarry = (uint32_t)(drainUnits % NEED_FULL_DRAIN_SECONDS);
+  applyNeedDrainTicks(peeTicks, foodTicks, playTicks, loveTicks);
+
+  // Carries have already absorbed elapsedSeconds, so always advance the clock
+  // (otherwise the next call would double-count this interval).
   lastNeedDrainEpoch = nowEpoch;
   rtcPetState.lastNeedDrainEpoch = lastNeedDrainEpoch;
-  rtcPetState.needDrainCarry = needDrainCarry;
+  rtcPetState.peeDrainCarry = peeDrainCarry;
+  rtcPetState.foodDrainCarry = foodDrainCarry;
+  rtcPetState.playDrainCarry = playDrainCarry;
+  rtcPetState.loveDrainCarry = loveDrainCarry;
 }
 
 // ---------------- PET STATE / SLEEP ----------------
@@ -1266,7 +1339,10 @@ void initDefaultPetState() {
   appMode = APP_HOME;
   homeSelection = HOME_OPTION_TAMAGOTCHI;
   lastNeedDrainEpoch = 0;
-  needDrainCarry = 0;
+  peeDrainCarry = 0;
+  foodDrainCarry = 0;
+  playDrainCarry = 0;
+  loveDrainCarry = 0;
   resetPetAgeTimer();
 }
 
@@ -1289,7 +1365,10 @@ void savePetStateToRtc() {
     lastNeedDrainEpoch = rtcPetState.epochSeconds;
   }
   rtcPetState.lastNeedDrainEpoch = lastNeedDrainEpoch;
-  rtcPetState.needDrainCarry = needDrainCarry;
+  rtcPetState.peeDrainCarry = peeDrainCarry;
+  rtcPetState.foodDrainCarry = foodDrainCarry;
+  rtcPetState.playDrainCarry = playDrainCarry;
+  rtcPetState.loveDrainCarry = loveDrainCarry;
 }
 
 bool restorePetStateFromRtc() {
@@ -1308,7 +1387,10 @@ bool restorePetStateFromRtc() {
   petAgeStarted = rtcPetState.petAgeStarted != 0;
   petBirthEpoch = rtcPetState.petBirthEpoch;
   lastNeedDrainEpoch = rtcPetState.lastNeedDrainEpoch;
-  needDrainCarry = rtcPetState.needDrainCarry;
+  peeDrainCarry = rtcPetState.peeDrainCarry;
+  foodDrainCarry = rtcPetState.foodDrainCarry;
+  playDrainCarry = rtcPetState.playDrainCarry;
+  loveDrainCarry = rtcPetState.loveDrainCarry;
 
   if (appMode > APP_EREADER) {
     appMode = APP_TAMAGOTCHI;
@@ -1343,9 +1425,8 @@ void applyNeedsSinceSleep() {
   drainNeedsOverTime();
 
   Serial.printf(
-    "Applied sleep need drain: elapsed=%lu seconds ticks=%lu\n",
-    (unsigned long)(nowEpoch - previousDrainEpoch),
-    (unsigned long)(((nowEpoch - previousDrainEpoch) * NEED_MAX_VALUE) / NEED_FULL_DRAIN_SECONDS)
+    "Applied sleep need drain: elapsed=%lu seconds\n",
+    (unsigned long)(nowEpoch - previousDrainEpoch)
   );
 }
 
