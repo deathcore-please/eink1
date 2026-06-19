@@ -42,7 +42,7 @@ void ButtonManager::begin() {
     st.lastDown = rawDown;
     st.pressedAt = rawDown ? now : 0;
     st.lastChangeAt = now;
-    st.longFired = rawDown;
+    st.longFired = false;
   }
 }
 

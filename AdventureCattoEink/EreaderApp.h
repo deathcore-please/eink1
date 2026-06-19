@@ -4,6 +4,8 @@
 
 void ereaderBegin();
 void ereaderEnter();
+void ereaderRequestEnter();
+bool ereaderActivateIfPending();
 void ereaderLoop();
 void ereaderLeave();
 bool ereaderWantsSleep();

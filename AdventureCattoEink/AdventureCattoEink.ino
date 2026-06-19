@@ -267,6 +267,10 @@ volatile bool menuButtonPressPending = false;
 volatile bool upInputArmed = true;
 volatile bool downInputArmed = true;
 
+// #region agent log
+volatile uint32_t mainEdgeCount = 0;
+// #endregion
+
 // Locks interrupt capture while an action animation is running.
 // This prevents accidental double-presses from being queued and replayed.
 volatile bool inputCaptureLocked = false;
@@ -299,6 +303,9 @@ void IRAM_ATTR handleMainToggleInterrupt() {
 
   lastMainIsrUs = now;
   pushInputEventFromISR(INPUT_MAIN);
+  // #region agent log
+  mainEdgeCount++;
+  // #endregion
 }
 
 void IRAM_ATTR handleUpInterrupt() {
@@ -1217,20 +1224,6 @@ void showModeSelectSplashScreen() {
   EPD_Init();
   clearImageBuffer();
   EPD_ShowString(88, 52, "SPLASH", BLACK, 16);
-  // #region agent log
-  uint32_t nonzeroBytes = 0;
-  for (uint32_t i = 0; i < ALLSCREEN_BYTES; i++) {
-    if (ImageBW[i] != 0) {
-      nonzeroBytes++;
-    }
-  }
-  Serial.printf(
-    "{\"sessionId\":\"439210\",\"hypothesisId\":\"A\",\"location\":"
-    "\"showModeSelectSplashScreen\",\"message\":\"splash buffer before refresh\","
-    "\"data\":{\"nonzeroBytes\":%lu},\"timestamp\":%lu}\n",
-    nonzeroBytes, millis()
-  );
-  // #endregion
   fullRefresh();
 }
 
@@ -1417,6 +1410,14 @@ void enterHomeScreen() {
 void enterTamagotchi() {
   Serial.println("Entering tamagotchi");
 
+  // #region agent log
+  Serial.printf(
+    "{\"sessionId\":\"439210\",\"hypothesisId\":\"M2\",\"location\":\"enterTamagotchi\","
+    "\"data\":{\"edgeCount\":%lu},\"timestamp\":%lu}\n",
+    (unsigned long)mainEdgeCount, (unsigned long)millis()
+  );
+  // #endregion
+
   startPetAgeTimerIfNeeded();
   attachMainInputInterrupts();
   resetMainInputState();
@@ -1435,7 +1436,7 @@ void enterEreaderMode() {
   appMode = APP_EREADER;
   discardWakeInput = false;
   lastActivityMs = millis();
-  ereaderEnter();
+  ereaderRequestEnter();
 }
 
 void startIdle() {
@@ -1558,6 +1559,14 @@ void startSelectedAction() {
   // after the action animation finishes.
   inputCaptureLocked = true;
   clearInputQueue();
+
+  // #region agent log
+  Serial.printf(
+    "{\"sessionId\":\"439210\",\"hypothesisId\":\"M3\",\"location\":\"startSelectedAction\","
+    "\"data\":{\"selectedAction\":%d,\"edgeCount\":%lu},\"timestamp\":%lu}\n",
+    (int)selectedAction, (unsigned long)mainEdgeCount, (unsigned long)millis()
+  );
+  // #endregion
 
   if (selectedAction == ACTION_PEE) {
     startPeeing();
@@ -1719,6 +1728,19 @@ void moveHomeSelectionDown() {
 
 void onMainToggleTap() {
   lastActivityMs = millis();
+
+  // #region agent log
+  static unsigned long s_lastTapMs = 0;
+  unsigned long s_nowTap = millis();
+  Serial.printf(
+    "{\"sessionId\":\"439210\",\"hypothesisId\":\"M1\",\"location\":\"onMainToggleTap\","
+    "\"data\":{\"appMode\":%d,\"petMode\":%d,\"edgeCount\":%lu,\"dtSinceLastTapMs\":%lu},"
+    "\"timestamp\":%lu}\n",
+    (int)appMode, (int)petMode, (unsigned long)mainEdgeCount,
+    (unsigned long)(s_nowTap - s_lastTapMs), (unsigned long)s_nowTap
+  );
+  s_lastTapMs = s_nowTap;
+  // #endregion
 
   if (appMode == APP_HOME) {
     if (homeSelection == HOME_OPTION_TAMAGOTCHI) {
@@ -1909,7 +1931,9 @@ void setup() {
   if (appMode == APP_HOME) {
     showHomeScreenFull();
   } else if (appMode == APP_EREADER) {
-    enterEreaderMode();
+    detachMainInputInterrupts();
+    resetMainInputState();
+    ereaderEnter();
   } else {
     startIdle();
   }
@@ -1963,6 +1987,8 @@ void loop() {
 
   if (appMode == APP_EREADER) {
     drainNeedsOverTime();
+
+    ereaderActivateIfPending();
 
     if (discardWakeInput) {
       while (popInputEvent() != INPUT_NONE) {}

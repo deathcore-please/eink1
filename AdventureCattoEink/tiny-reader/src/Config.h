@@ -1,6 +1,7 @@
 #pragma once
 
 #include <Arduino.h>
+#include <SPI.h>
 #include <GxEPD2_BW.h>
 
 // Display driver selection

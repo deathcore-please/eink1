@@ -1,11 +1,13 @@
 #include "EreaderApp.h"
 
 #include <Arduino.h>
+#include <SPI.h>
 #include <LittleFS.h>
 #include <esp_sleep.h>
 #include <esp_system.h>
 #include <vector>
 
+#include "EPD.h"
 #include "tiny-reader/src/Config.h"
 #include "tiny-reader/src/Input.h"
 #include "tiny-reader/src/Storage.h"
@@ -56,6 +58,7 @@ int libraryIndex = 0;
 int libraryScroll = 0;
 bool initialized = false;
 bool storageReady = false;
+bool activationPending = false;
 RTC_DATA_ATTR uint32_t ereaderRtcMagic = 0;
 RTC_DATA_ATTR uint8_t ereaderRtcScreen = static_cast<uint8_t>(ScreenId::MenuLibrary);
 constexpr uint32_t EREADER_RTC_MAGIC = 0xEAD30001UL;
@@ -344,6 +347,7 @@ void renderCurrentPage(bool allowPartial) {
                            : 0;
 
   bool usePartial = allowPartial && (partialCount < Config::PARTIAL_REFRESH_LIMIT);
+
   uiDrawReader(display, view, usePartial);
 
   if (view.bytesConsumed == 0 && page.endPos > reader.pagePos) {
@@ -678,23 +682,42 @@ void ereaderBegin() {
     analogReadResolution(12);
   }
 
-  uiInit(display);
-  storageReady = ensureStorageReady();
   initialized = true;
   lastActivity = millis();
 }
 
-void ereaderEnter() {
-  ereaderBegin();
+void releaseTamagotchiDisplay() {
+  EPD_Sleep();
+  delay(50);
+  digitalWrite(Config::PIN_EPD_POWER, LOW);
+  delay(50);
   digitalWrite(Config::PIN_EPD_POWER, HIGH);
+  delay(50);
+
+  // The tamagotchi side bit-bangs the shared SPI pins, leaving the hardware
+  // SPI peripheral detached. Tear it down so GxEPD2's init() re-attaches the
+  // pins cleanly; otherwise the next hardware-SPI transfer deadlocks.
+  SPI.end();
+  delay(10);
+}
+
+void ereaderEnter() {
+  releaseTamagotchiDisplay();
+  ereaderBegin();
   uiInit(display);
   buttons.begin();
 
   if (!storageReady) {
-    ensureStorageReady();
+    storageReady = ensureStorageReady();
+  }
+
+  if (!storageReady) {
+    updateActivity();
+    return;
   }
 
   String current = storageGetCurrentBook();
+
   if (canResumeReaderScreen() && current.length() > 0) {
     openBook(current, false);
     showScreen(ScreenId::Reader);
@@ -703,6 +726,20 @@ void ereaderEnter() {
   }
 
   updateActivity();
+}
+
+void ereaderRequestEnter() {
+  activationPending = true;
+}
+
+bool ereaderActivateIfPending() {
+  if (!activationPending) {
+    return false;
+  }
+
+  activationPending = false;
+  ereaderEnter();
+  return true;
 }
 
 void ereaderLoop() {
@@ -716,11 +753,16 @@ void ereaderLoop() {
 }
 
 void ereaderLeave() {
+  activationPending = false;
+
   if (reader.file) {
     storageSaveProgress(reader.path, reader.pagePos);
     saveNavigationState();
+    reader.file.close();
   }
+
   saveEreaderResumeScreen(screen);
+  partialCount = 0;
   display.hibernate();
 }
 
