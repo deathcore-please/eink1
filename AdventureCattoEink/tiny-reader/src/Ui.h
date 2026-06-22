@@ -33,6 +33,9 @@ void uiInit(EpdDisplay& display);
 const UiLayout& uiLayout();
 const UiLayout& uiReaderLayout();
 
+void uiSetReaderDarkMode(bool on);
+bool uiReaderDarkMode();
+
 size_t uiMeasureReaderBytes(EpdDisplay& display, const String& text);
 void uiDrawReader(EpdDisplay& display, const ReaderView& view, bool partial);
 void uiDrawLibrary(EpdDisplay& display, const std::vector<BookInfo>& books, int selectedIndex, int scrollIndex);

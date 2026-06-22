@@ -11,6 +11,7 @@
 #include "tiny-reader/src/Config.h"
 #include "tiny-reader/src/Input.h"
 #include "tiny-reader/src/Storage.h"
+#include "tiny-reader/src/TextEncoding.h"
 #include "tiny-reader/src/Ui.h"
 
 namespace {
@@ -61,6 +62,7 @@ bool storageReady = false;
 bool activationPending = false;
 RTC_DATA_ATTR uint32_t ereaderRtcMagic = 0;
 RTC_DATA_ATTR uint8_t ereaderRtcScreen = static_cast<uint8_t>(ScreenId::MenuLibrary);
+RTC_DATA_ATTR uint8_t ereaderRtcDarkMode = 0;
 constexpr uint32_t EREADER_RTC_MAGIC = 0xEAD30001UL;
 constexpr uint32_t NAV_STATE_VERSION = 1001UL;
 constexpr uint32_t NAV_CHECKPOINT_INTERVAL = 20UL;
@@ -229,6 +231,11 @@ PageData readPage(File& file) {
   int bytesRead = file.read(reinterpret_cast<uint8_t*>(buffer), Config::READ_BUFFER_SIZE);
 
   if (bytesRead > 0) {
+    size_t drop = trailingIncompleteUtf8Bytes(buffer, static_cast<size_t>(bytesRead));
+    if (drop > 0) {
+      bytesRead -= static_cast<int>(drop);
+      file.seek(page.startPos + bytesRead);
+    }
     page.text = String(reinterpret_cast<char*>(buffer), bytesRead);
   } else {
     page.text = "";
@@ -655,6 +662,8 @@ void handleButtons() {
         action = true;
       }
       if (buttons.consumeShortPress(ButtonId::Ok)) {
+        ereaderRtcDarkMode = ereaderRtcDarkMode ? 0 : 1;
+        uiSetReaderDarkMode(ereaderRtcDarkMode != 0);
         showScreen(ScreenId::MenuInfo);
         action = true;
       }
@@ -705,6 +714,7 @@ void ereaderEnter() {
   releaseTamagotchiDisplay();
   ereaderBegin();
   uiInit(display);
+  uiSetReaderDarkMode(ereaderRtcDarkMode != 0);
   buttons.begin();
 
   if (!storageReady) {
@@ -775,4 +785,5 @@ bool ereaderWantsSleep() {
 
 #include "tiny-reader/src/Input.cpp"
 #include "tiny-reader/src/Storage.cpp"
+#include "tiny-reader/src/TextEncoding.cpp"
 #include "tiny-reader/src/Ui.cpp"

@@ -31,7 +31,7 @@ namespace Config {
   constexpr uint8_t UI_TEXT_SIZE = 1;
   constexpr uint8_t READER_TEXT_SIZE = 1;
   constexpr int16_t UI_MIN_MARGIN = 4;
-  constexpr uint8_t PARTIAL_REFRESH_LIMIT = 10;
+  constexpr uint8_t PARTIAL_REFRESH_LIMIT = 3;
   constexpr uint16_t WIFI_SETTINGS_FULL_REFRESH_EVERY = 30;
 
   // Timing

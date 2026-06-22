@@ -1,8 +1,10 @@
 #include "Ui.h"
 #include "FreeSerif9pt8b.h"
+#include "TextEncoding.h"
 
 static UiLayout layout;
 static UiLayout readerLayout;
+static bool readerDarkMode = false;
 static const char* kMenuLabels[] = {"Library", "Info"};
 static const uint8_t kMenuCount = sizeof(kMenuLabels) / sizeof(kMenuLabels[0]);
 
@@ -95,10 +97,144 @@ const UiLayout& uiReaderLayout() {
   return readerLayout;
 }
 
+void uiSetReaderDarkMode(bool on) {
+  readerDarkMode = on;
+}
+
+bool uiReaderDarkMode() {
+  return readerDarkMode;
+}
+
 static void prepareReaderTextMetrics(EpdDisplay& display) {
   display.setTextSize(Config::READER_TEXT_SIZE);
   display.setFont(&FreeSerif9pt8b);
   display.setTextWrap(false);
+}
+
+static bool isReaderPunctuation(uint8_t c) {
+  return c == '\'' || c == '"' || c == '-' || c == '_';
+}
+
+static int16_t readerPunctAdvance(uint8_t c) {
+  switch (c) {
+    case '\'':
+      return 3;
+    case '"':
+      return 7;
+    case '-':
+      return 6;
+    case '_':
+      return 8;
+    default:
+      return 0;
+  }
+}
+
+static void expandBounds(int16_t x1, int16_t y1, int16_t x2, int16_t y2,
+                         int16_t& minx, int16_t& miny, int16_t& maxx, int16_t& maxy) {
+  if (x1 < minx) {
+    minx = x1;
+  }
+  if (y1 < miny) {
+    miny = y1;
+  }
+  if (x2 > maxx) {
+    maxx = x2;
+  }
+  if (y2 > maxy) {
+    maxy = y2;
+  }
+}
+
+static int16_t fontGlyphAdvance(uint8_t c) {
+  if (c < 0x20 || c > 0xFE) {
+    return 0;
+  }
+  const GFXglyph* glyph = &FreeSerif9ptGlyphs[c - 0x20];
+  return static_cast<int16_t>(pgm_read_byte(&glyph->xAdvance)) * Config::READER_TEXT_SIZE;
+}
+
+static void getDisplayLineMetrics(EpdDisplay& display, const String& line,
+                                  int16_t* x1, int16_t* y1, uint16_t* w, uint16_t* h) {
+  int16_t x = 0;
+  int16_t minx = 0x7FFF;
+  int16_t miny = 0x7FFF;
+  int16_t maxx = -1;
+  int16_t maxy = -1;
+
+  for (size_t i = 0; i < line.length(); ++i) {
+    uint8_t c = static_cast<uint8_t>(line[i]);
+    if (isReaderPunctuation(c)) {
+      switch (c) {
+        case '-':
+          expandBounds(x + 1, -3, x + 5, -2, minx, miny, maxx, maxy);
+          break;
+        case '\'':
+          expandBounds(x + 1, -10, x + 2, -7, minx, miny, maxx, maxy);
+          break;
+        case '"':
+          expandBounds(x + 1, -10, x + 5, -7, minx, miny, maxx, maxy);
+          break;
+        case '_':
+          expandBounds(x + 1, 1, x + 6, 2, minx, miny, maxx, maxy);
+          break;
+        default:
+          break;
+      }
+      x += readerPunctAdvance(c);
+    } else {
+      char ch[2] = {static_cast<char>(c), '\0'};
+      int16_t cx1 = 0;
+      int16_t cy1 = 0;
+      uint16_t cw = 0;
+      uint16_t chh = 0;
+      display.getTextBounds(ch, x, 0, &cx1, &cy1, &cw, &chh);
+      expandBounds(cx1, cy1, cx1 + static_cast<int16_t>(cw) - 1,
+                   cy1 + static_cast<int16_t>(chh) - 1, minx, miny, maxx, maxy);
+      x += fontGlyphAdvance(c);
+    }
+  }
+
+  *x1 = (maxx >= minx) ? minx : 0;
+  *y1 = (maxy >= miny) ? miny : 0;
+  *w = (maxx >= minx) ? static_cast<uint16_t>(maxx - minx + 1) : 0;
+  *h = (maxy >= miny) ? static_cast<uint16_t>(maxy - miny + 1) : 0;
+}
+
+static void printDisplayLine(EpdDisplay& display, const String& line, int16_t baselineY) {
+  uint16_t fg = readerDarkMode ? GxEPD_WHITE : GxEPD_BLACK;
+  int16_t x = display.getCursorX();
+  for (size_t i = 0; i < line.length(); ++i) {
+    uint8_t c = static_cast<uint8_t>(line[i]);
+    if (isReaderPunctuation(c)) {
+      switch (c) {
+        case '-':
+          display.fillRect(x + 1, baselineY - 3, 5, 2, fg);
+          x += 6;
+          break;
+        case '\'':
+          display.fillRect(x + 1, baselineY - 10, 2, 4, fg);
+          x += 3;
+          break;
+        case '"':
+          display.fillRect(x + 1, baselineY - 10, 2, 4, fg);
+          display.fillRect(x + 4, baselineY - 10, 2, 4, fg);
+          x += 7;
+          break;
+        case '_':
+          display.fillRect(x + 1, baselineY + 1, 6, 2, fg);
+          x += 8;
+          break;
+        default:
+          break;
+      }
+    } else {
+      display.setCursor(x, baselineY);
+      display.write(c);
+      x = display.getCursorX();
+    }
+  }
+  display.setCursor(x, baselineY);
 }
 
 size_t uiMeasureReaderBytes(EpdDisplay& display, const String& text) {
@@ -136,9 +272,10 @@ size_t uiMeasureReaderBytes(EpdDisplay& display, const String& text) {
 
       String word = text.substring(charPos, wordEnd);
       String candidateLine = lineText.isEmpty() ? word : lineText + " " + word;
+      String displayLine = toDisplayText(candidateLine);
       int16_t x1 = 0, y1 = 0;
       uint16_t w = 0, h = 0;
-      display.getTextBounds(candidateLine.c_str(), 0, 0, &x1, &y1, &w, &h);
+      getDisplayLineMetrics(display, displayLine, &x1, &y1, &w, &h);
 
       if (static_cast<int16_t>(w) > r.contentW && !lineText.isEmpty()) {
         break;
@@ -161,7 +298,11 @@ size_t uiMeasureReaderBytes(EpdDisplay& display, const String& text) {
 void uiDrawReader(EpdDisplay& display, const ReaderView& view, bool partial) {
   const UiLayout& r = readerLayout;
   prepareReaderTextMetrics(display);
-  
+
+  uint16_t bg = readerDarkMode ? GxEPD_BLACK : GxEPD_WHITE;
+  uint16_t fg = readerDarkMode ? GxEPD_WHITE : GxEPD_BLACK;
+  display.setTextColor(fg);
+
   int16_t sampleX1 = 0;
   int16_t sampleY1 = 0;
   uint16_t sampleW = 0;
@@ -181,9 +322,9 @@ void uiDrawReader(EpdDisplay& display, const ReaderView& view, bool partial) {
   
   do {
     if (!partial) {
-      display.fillScreen(GxEPD_WHITE);
+      display.fillScreen(bg);
     } else {
-      display.fillRect(r.contentX, r.contentY, r.contentW, r.height - r.contentY, GxEPD_WHITE);
+      display.fillRect(r.contentX, r.contentY, r.contentW, r.height - r.contentY, bg);
     }
 
     int16_t visualLineIndex = 0;
@@ -220,9 +361,10 @@ void uiDrawReader(EpdDisplay& display, const ReaderView& view, bool partial) {
         // Build and measure a test line
         String word = view.text.substring(charPos, wordEnd);
         String candidateLine = lineText.isEmpty() ? word : lineText + " " + word;
+        String displayLine = toDisplayText(candidateLine);
         int16_t x1 = 0, y1 = 0;
         uint16_t w = 0, h = 0;
-        display.getTextBounds(candidateLine.c_str(), 0, 0, &x1, &y1, &w, &h);
+        getDisplayLineMetrics(display, displayLine, &x1, &y1, &w, &h);
 
         // If the word doesn't fit (and it's not the only word on the line), leave it for the next line
         if (static_cast<int16_t>(w) > r.contentW && !lineText.isEmpty()) {
@@ -238,8 +380,9 @@ void uiDrawReader(EpdDisplay& display, const ReaderView& view, bool partial) {
 
       // Render the compiled line (if any text was collected)
       if (!lineText.isEmpty()) {
-        display.setCursor(r.contentX - lastLineX1, lineBaselineY + static_cast<int16_t>(visualLineIndex) * r.lineHeight);
-        display.print(lineText);
+        int16_t lineY = lineBaselineY + static_cast<int16_t>(visualLineIndex) * r.lineHeight;
+        display.setCursor(r.contentX - lastLineX1, lineY);
+        printDisplayLine(display, toDisplayText(lineText), lineY);
       }
 
       // Always advance the line index (handles both printed lines and explicit empty \n lines)
@@ -249,8 +392,8 @@ void uiDrawReader(EpdDisplay& display, const ReaderView& view, bool partial) {
     // Render Progress Bar
     int16_t barY = r.height - 1;
     int16_t barW = map(view.progressPercent, 0, 100, 0, r.contentW);
-    display.fillRect(r.contentX, barY, r.contentW, 1, GxEPD_WHITE);
-    display.fillRect(r.contentX, barY, barW, 1, GxEPD_BLACK);
+    display.fillRect(r.contentX, barY, r.contentW, 1, bg);
+    display.fillRect(r.contentX, barY, barW, 1, fg);
 
   } while (display.nextPage());
 
@@ -260,6 +403,7 @@ void uiDrawReader(EpdDisplay& display, const ReaderView& view, bool partial) {
   display.setTextSize(Config::UI_TEXT_SIZE);
   display.setFont(nullptr);
   display.setTextWrap(true);
+  display.setTextColor(GxEPD_BLACK);
   display.powerOff();
 }
 
@@ -333,7 +477,12 @@ void uiDrawInfo(EpdDisplay& display, const StorageStats& stats, float battV, int
 
     y += layout.lineHeight * 2;
     display.setCursor(layout.contentX, y);
-    display.print("OK: refresh stats");
+    display.print("Theme: ");
+    display.print(readerDarkMode ? "Dark" : "Light");
+    y += layout.lineHeight;
+
+    display.setCursor(layout.contentX, y);
+    display.print("OK: toggle theme");
   } while (display.nextPage());
   display.powerOff();
 }

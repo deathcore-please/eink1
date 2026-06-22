@@ -1,0 +1,9 @@
+Punctuation test (ASCII)
+don't say "hello" - file_name
+word-word and it's fine.
+
+Punctuation test (UTF-8 smart quotes and dashes)
+don’t say “hello” – file_name
+word—word and it’s fine.
+
+Expected: apostrophes, quotes, dashes, and underscores all render clearly.
