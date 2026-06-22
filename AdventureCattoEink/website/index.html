@@ -1,0 +1,132 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>ANVI Device Manager</title>
+    <link rel="stylesheet" href="./styles.css">
+  </head>
+  <body>
+    <header class="topbar">
+      <div class="shell topbar-inner">
+        <div>
+          <p class="kicker">Device Manager</p>
+          <h1>ANVI</h1>
+        </div>
+        <div id="connectionState" class="connection-state">
+          <span></span>
+          Disconnected
+        </div>
+      </div>
+    </header>
+
+    <main class="shell">
+      <p id="browserNotice" class="notice" hidden>
+        Web Serial requires Chrome or Edge on HTTPS or localhost.
+      </p>
+
+      <section class="section">
+        <div class="section-title">
+          <svg viewBox="0 0 24 24" aria-hidden="true">
+            <path d="M8 6v4M16 6v4M7 10h10v4a5 5 0 0 1-10 0v-4ZM12 19v-3" />
+          </svg>
+          <span>Connection</span>
+        </div>
+
+        <div class="connection-grid">
+          <label class="field port-field">
+            <span>Port</span>
+            <select id="portSelect">
+              <option value="">Select device</option>
+            </select>
+          </label>
+
+          <button id="connectButton" class="primary-button" type="button">Connect</button>
+        </div>
+
+        <p id="statusText" class="status-line" hidden></p>
+      </section>
+
+      <section class="section storage-section">
+        <div class="section-title no-icon">
+          <span>Storage</span>
+        </div>
+
+        <div class="storage-head">
+          <div class="used-display">
+            <strong id="usedNumber">0</strong>
+            <span id="usedUnit">B used</span>
+          </div>
+          <div class="storage-totals">
+            <strong id="totalBytes">0 B total</strong>
+            <span id="freeBytes">0 B free</span>
+          </div>
+        </div>
+
+        <div class="storage-meter" aria-label="Storage used">
+          <div id="storageFill" class="storage-fill"></div>
+        </div>
+        <p id="storageDetail" class="storage-detail">0% capacity - 0 titles stored</p>
+      </section>
+
+      <section class="section library-section">
+        <div class="library-title-row">
+          <div class="section-title no-icon">
+            <span>Library</span>
+          </div>
+          <span id="bookCount" class="title-count">0 Titles</span>
+        </div>
+
+        <table class="library-table">
+          <thead>
+            <tr>
+              <th>Title</th>
+              <th>Size</th>
+              <th class="action-heading"></th>
+            </tr>
+          </thead>
+          <tbody id="bookRows">
+            <tr>
+              <td colspan="3" class="empty-row">No titles on device.</td>
+            </tr>
+          </tbody>
+        </table>
+      </section>
+
+      <section class="section upload-section">
+        <div class="section-title">
+          <svg viewBox="0 0 24 24" aria-hidden="true">
+            <path d="M12 16V5M8 9l4-4 4 4M5 14v5h14v-5" />
+          </svg>
+          <span>Add To Library</span>
+        </div>
+
+        <label id="dropZone" class="drop-zone" for="fileInput">
+          <svg viewBox="0 0 24 24" aria-hidden="true">
+            <path d="M12 16V5M8 9l4-4 4 4M5 14v5h14v-5" />
+          </svg>
+          <strong>Drop .txt, .epub, or .pdf files here</strong>
+          <span>or click to browse</span>
+        </label>
+        <p class="format-caution">.txt files are fully supported, .epub files are kinda supported, and .pdf files are a scam but try and see what happens maybe it uploads</p>
+        <input id="fileInput" type="file" accept=".txt,.epub,.pdf,text/plain,application/epub+zip,application/pdf">
+
+        <div id="uploadProgress" class="upload-progress" hidden>
+          <div>
+            <div id="uploadFill"></div>
+          </div>
+          <span id="uploadText">Waiting</span>
+        </div>
+      </section>
+    </main>
+
+    <footer class="credit">
+      <span class="copyright-mark">C</span>
+      <span>Developed by your favourite moth</span>
+    </footer>
+
+    <script src="./vendor/jszip.min.js"></script>
+    <script src="./vendor/pdf.min.js"></script>
+    <script src="./app.js"></script>
+  </body>
+</html>

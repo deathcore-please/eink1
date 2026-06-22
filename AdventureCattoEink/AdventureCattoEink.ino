@@ -23,6 +23,8 @@
 #include "menu_cat_icon.h"
 #include "menu_reader_icon.h"
 #include "EreaderApp.h"
+#include "SerialLibraryPortal.h"
+#include "library_portal_image.h"
 
 extern uint8_t ImageBW[ALLSCREEN_BYTES];
 
@@ -252,6 +254,8 @@ unsigned long upReleasedSinceMs = 0;
 unsigned long downReleasedSinceMs = 0;
 bool discardWakeInput = false;
 bool forceFullRefreshNextFrame = false;
+bool serialPortalDisplayActive = false;
+bool serialPortalPreviousInputCaptureLocked = false;
 bool hasSeenDeliveryIntro = false;
 bool pendingRunaway = false;
 unsigned long introStartedMs = 0;
@@ -516,6 +520,13 @@ void clearInputQueue() {
   noInterrupts();
   inputQueueHead = 0;
   inputQueueTail = 0;
+  interrupts();
+}
+
+void clearAllPendingInput() {
+  clearInputQueue();
+  noInterrupts();
+  menuButtonPressPending = false;
   interrupts();
 }
 
@@ -1491,6 +1502,117 @@ void drawAnimationFrame(const Animation* anim, const uint8_t* sprite) {
   EPD_Sleep();
 }
 
+void drawSerialPortalConnectedScreen() {
+  EPD_Init();
+  clearImageBuffer();
+  drawVerticalLsbBitmap(
+    0,
+    0,
+    img_51f2d38d_9eaf_4d7d_b192_3abc2d570052__1___1_,
+    img_51f2d38d_9eaf_4d7d_b192_3abc2d570052__1___1__width,
+    img_51f2d38d_9eaf_4d7d_b192_3abc2d570052__1___1__height
+  );
+  fullRefresh();
+}
+
+void redrawTamagotchiAfterSerialPortal() {
+  forceFullRefreshNextFrame = true;
+
+  if ((pendingRunaway || happinessValue == 0) && petMode != PET_RAN_AWAY) {
+    pendingRunaway = false;
+    showRunawayScreen();
+    return;
+  }
+
+  if (petMode == PET_SLEEP_SELECT) {
+    drawSleepDialog();
+    return;
+  }
+
+  if (petMode == PET_COOLDOWN_MSG) {
+    drawCooldownDialog();
+    return;
+  }
+
+  if (petMode == PET_RAN_AWAY) {
+    showRunawayScreen();
+    return;
+  }
+
+  if (petMode == PET_INTRO) {
+    showIntroPlaceholder();
+    return;
+  }
+
+  drawAnimationFrame(
+    currentAnimation,
+    getAnimationFrame(currentAnimation, currentFrame)
+  );
+}
+
+void enterSerialPortalDisplay() {
+  if (serialPortalDisplayActive) {
+    return;
+  }
+
+  serialPortalDisplayActive = true;
+  serialPortalPreviousInputCaptureLocked = inputCaptureLocked;
+  inputCaptureLocked = true;
+  clearAllPendingInput();
+
+  if (appMode == APP_EREADER) {
+    ereaderLeave();
+  }
+
+  drawSerialPortalConnectedScreen();
+  lastActivityMs = millis();
+}
+
+void exitSerialPortalDisplay() {
+  if (!serialPortalDisplayActive) {
+    return;
+  }
+
+  serialPortalDisplayActive = false;
+  inputCaptureLocked = serialPortalPreviousInputCaptureLocked;
+  clearAllPendingInput();
+
+  if (appMode == APP_HOME) {
+    attachMainInputInterrupts();
+    resetMainInputState();
+    showHomeScreenFull();
+  } else if (appMode == APP_EREADER) {
+    detachMainInputInterrupts();
+    resetMainInputState();
+    ereaderEnter();
+  } else {
+    attachMainInputInterrupts();
+    resetMainInputState();
+    redrawTamagotchiAfterSerialPortal();
+  }
+
+  clearAllPendingInput();
+  lastActivityMs = millis();
+}
+
+bool handleSerialPortalDisplayState() {
+  bool transitioned = false;
+
+  if (serialLibraryPortalConsumeConnectedEvent() ||
+      (serialLibraryPortalIsConnected() && !serialPortalDisplayActive)) {
+    enterSerialPortalDisplay();
+    transitioned = true;
+  }
+
+  if (serialLibraryPortalConsumeDisconnectedEvent() ||
+      (!serialLibraryPortalIsConnected() && serialPortalDisplayActive)) {
+    exitSerialPortalDisplay();
+    transitioned = true;
+  }
+
+  return transitioned;
+}
+
 // ---------------- NEED / METER LOGIC ----------------
 
 uint8_t valueForSadNeed(SadNeed need) {
@@ -1714,6 +1836,11 @@ void updateHappiness(uint32_t elapsedSeconds) {
 
 void maybeTriggerRunaway() {
   if (happinessValue > 0) {
+    return;
+  }
+
+  if (serialPortalDisplayActive) {
+    pendingRunaway = true;
     return;
   }
 
@@ -2652,6 +2779,7 @@ void processInputEvent(InputEvent event) {
 
 void setup() {
   Serial.begin(115200);
+  serialLibraryPortalBegin();
   delay(500);
 
   esp_sleep_wakeup_cause_t wakeCause = esp_sleep_get_wakeup_cause();
@@ -2721,6 +2849,26 @@ void setup() {
 
 void loop() {
   unsigned long now = millis();
+  bool serialPortalSawInput = serialLibraryPortalLoop();
+  bool serialPortalTransitioned = handleSerialPortalDisplayState();
+  bool serialPortalKeepAwake = serialPortalSawInput || serialLibraryPortalIsBusy();
+  if (serialPortalKeepAwake) {
+    lastActivityMs = now;
+  }
+
+  if (serialPortalTransitioned) {
+    delay(5);
+    return;
+  }
+
+  if (serialPortalDisplayActive) {
+    drainNeedsOverTime();
+    clearAllPendingInput();
+    lastActivityMs = now;
+    delay(5);
+    return;
+  }
+
   updateDirectionalInputArming();
 
   if (appMode == APP_HOME) {
@@ -2789,7 +2937,7 @@ void loop() {
 
     ereaderLoop();
 
-    if (ereaderWantsSleep()) {
+    if (!serialPortalKeepAwake && ereaderWantsSleep()) {
       enterDeepSleep();
       return;
     }
