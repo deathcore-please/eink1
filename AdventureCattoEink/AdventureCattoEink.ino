@@ -4,6 +4,7 @@
 #include <pgmspace.h>
 #include <esp_sleep.h>
 #include <esp_timer.h>
+#include <esp_random.h>
 #include <sys/time.h>
 #include <time.h>
 #include <stdio.h>
@@ -67,7 +68,7 @@ extern uint8_t ImageBW[ALLSCREEN_BYTES];
 #define PEE_FULL_DRAIN_SECONDS  (6UL * 3600UL)
 #define FOOD_FULL_DRAIN_SECONDS (4UL * 3600UL)
 #define PLAY_FULL_DRAIN_SECONDS (6UL * 3600UL)
-#define PET_FULL_DRAIN_SECONDS  (2UL * 3600UL)
+#define PET_FULL_DRAIN_SECONDS  (3UL * 3600UL)
 #define NEED_MAX_VALUE 100UL
 #define NEED_SAD_THRESHOLD 10
 #define HAPPINESS_CRISIS_SECONDS_PER_POINT_PER_NEED (45UL * 60UL)
@@ -77,6 +78,7 @@ extern uint8_t ImageBW[ALLSCREEN_BYTES];
 #define INACTIVITY_TIMEOUT_MS 30000
 #define MENU_BUTTON_DEBOUNCE_MS 30
 #define RTC_PET_STATE_MAGIC 0xCA77000FUL
+#define RTC_SPLASH_ROTATION_MAGIC 0x5A1A5001UL
 #define WAKE_BUTTON_PIN_MASK ((1ULL << EXIT_KEY) | (1ULL << HOME_KEY) | (1ULL << NEXT_KEY) | (1ULL << OK_KEY) | (1ULL << PRV_KEY))
 
 // Local hour offset from UTC (seconds). Adjust for your timezone.
@@ -273,6 +275,7 @@ void drawSleepRow();
 void drawSleepScreen();
 void drawSleepDialog();
 void openSleepDialog();
+void cancelSleepDialog();
 void startSleep(uint32_t durationSec);
 void wakeCatFromSleep(bool early);
 bool isActionOnCooldown(SelectedAction action);
@@ -311,6 +314,12 @@ RTC_DATA_ATTR struct {
   uint32_t foodCooldownUntilEpoch;
   uint32_t playCooldownUntilEpoch;
 } rtcPetState;
+
+RTC_DATA_ATTR struct {
+  uint32_t magic;
+  uint8_t order[DEEP_SLEEP_SPLASH_COUNT];
+  uint8_t position;
+} rtcSplashRotationState;
 
 // These ones actually change over time
 uint8_t peeValue = 100;
@@ -1102,6 +1111,21 @@ void openSleepDialog() {
   lastActivityMs = millis();
 }
 
+void cancelSleepDialog() {
+  petMode = PET_IDLE;
+  sleepDialogChoice = 0;
+  activeAction = ACTIVE_NONE;
+  currentActivityMessage = "";
+  clearInputQueue();
+  forceFullRefreshNextFrame = true;
+  drawAnimationFrame(
+    currentAnimation,
+    getAnimationFrame(currentAnimation, currentFrame)
+  );
+  inputLockoutUntil = millis() + 100;
+  lastActivityMs = millis();
+}
+
 void drawCooldownDialog() {
   EPD_Init();
   clearImageBuffer();
@@ -1785,7 +1809,7 @@ uint32_t computeNeedTicks(uint32_t elapsedSeconds, uint32_t fullDrainSeconds, ui
 }
 
 uint8_t computeHappinessFromNeeds() {
-  uint16_t sum = 4u * foodValue + 3u * loveValue + 2u * playValue + 1u * peeValue;
+  uint16_t sum = 4u * foodValue + 3u * peeValue + 2u * playValue + 1u * loveValue;
   return (uint8_t)((sum + 5) / 10);
 }
 
@@ -1998,13 +2022,63 @@ void initDeviceTime(bool restoreFromRtc) {
   refreshRtcEpochFromClock();
 }
 
+bool isSplashRotationStateValid() {
+  if (rtcSplashRotationState.magic != RTC_SPLASH_ROTATION_MAGIC ||
+      rtcSplashRotationState.position > DEEP_SLEEP_SPLASH_COUNT) {
+    return false;
+  }
+
+  bool seen[DEEP_SLEEP_SPLASH_COUNT] = {};
+  for (uint8_t i = 0; i < DEEP_SLEEP_SPLASH_COUNT; i++) {
+    uint8_t idx = rtcSplashRotationState.order[i];
+    if (idx >= DEEP_SLEEP_SPLASH_COUNT || seen[idx]) {
+      return false;
+    }
+    seen[idx] = true;
+  }
+
+  return true;
+}
+
+void shuffleSplashRotationState() {
+  rtcSplashRotationState.magic = RTC_SPLASH_ROTATION_MAGIC;
+  rtcSplashRotationState.position = 0;
+
+  for (uint8_t i = 0; i < DEEP_SLEEP_SPLASH_COUNT; i++) {
+    rtcSplashRotationState.order[i] = i;
+  }
+
+  for (int i = DEEP_SLEEP_SPLASH_COUNT - 1; i > 0; i--) {
+    uint8_t j = (uint8_t)(esp_random() % (uint32_t)(i + 1));
+    uint8_t tmp = rtcSplashRotationState.order[i];
+    rtcSplashRotationState.order[i] = rtcSplashRotationState.order[j];
+    rtcSplashRotationState.order[j] = tmp;
+  }
+}
+
+uint8_t nextDeepSleepSplashIndex(uint8_t& cyclePosition) {
+  if (!isSplashRotationStateValid() ||
+      rtcSplashRotationState.position >= DEEP_SLEEP_SPLASH_COUNT) {
+    shuffleSplashRotationState();
+  }
+
+  uint8_t idx = rtcSplashRotationState.order[rtcSplashRotationState.position];
+  cyclePosition = rtcSplashRotationState.position + 1;
+  rtcSplashRotationState.position++;
+  return idx;
+}
+
 void showDeepSleepSplashScreen() {
-  randomSeed((uint32_t)esp_timer_get_time() ^ (uint32_t)micros());
-  uint8_t idx = random(DEEP_SLEEP_SPLASH_COUNT);
+  uint8_t cyclePosition = 0;
+  uint8_t idx = nextDeepSleepSplashIndex(cyclePosition);
   const uint8_t* image = (const uint8_t*)pgm_read_ptr(&deepSleepSplashes[idx]);
 
-  Serial.print("Deep sleep splash: ");
-  Serial.println(idx);
+  Serial.printf(
+    "Deep sleep splash: %u (%u/%u)\n",
+    idx,
+    cyclePosition,
+    DEEP_SLEEP_SPLASH_COUNT
+  );
 
   EPD_Init();
   EPD_ALL_Fill(WHITE);
@@ -2974,6 +3048,12 @@ void loop() {
     }
 
     if (now < inputLockoutUntil) {
+      delay(5);
+      return;
+    }
+
+    if (digitalRead(EXIT_KEY) == LOW) {
+      cancelSleepDialog();
       delay(5);
       return;
     }
