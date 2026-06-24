@@ -2,6 +2,8 @@
 
 #include <Arduino.h>
 #include <LittleFS.h>
+#include <Preferences.h>
+#include <esp_random.h>
 #include <vector>
 
 #include "tiny-reader/src/Config.h"
@@ -12,6 +14,8 @@ namespace {
 constexpr size_t MAX_COMMAND_LINE = 1800;
 constexpr const char* RESPONSE_PREFIX = "ACAT ";
 constexpr uint32_t PORTAL_KEEP_AWAKE_MS = 90UL * 1000UL;
+constexpr const char* DEVICE_ID_NAMESPACE = "acat-device";
+constexpr const char* DEVICE_ID_KEY = "deviceId";
 
 String commandLine;
 bool storageReady = false;
@@ -24,6 +28,7 @@ File uploadFile;
 String uploadPath;
 size_t uploadExpected = 0;
 size_t uploadReceived = 0;
+String cachedDeviceId;
 
 void cancelUpload(bool removePartial);
 
@@ -38,6 +43,67 @@ bool ensureStorage() {
 
   storageReady = storageEnsureDirs();
   return storageReady;
+}
+
+bool isValidDeviceId(const String& value) {
+  if (!value.startsWith("acat-") || value.length() != 37) {
+    return false;
+  }
+
+  for (size_t i = 5; i < value.length(); ++i) {
+    char c = value[i];
+    bool hex = (c >= '0' && c <= '9') ||
+               (c >= 'a' && c <= 'f') ||
+               (c >= 'A' && c <= 'F');
+    if (!hex) {
+      return false;
+    }
+  }
+
+  return true;
+}
+
+String generateDeviceId() {
+  char id[38] = {};
+  uint32_t parts[4] = {
+    esp_random(),
+    esp_random(),
+    esp_random(),
+    esp_random()
+  };
+
+  snprintf(
+    id,
+    sizeof(id),
+    "acat-%08lx%08lx%08lx%08lx",
+    static_cast<unsigned long>(parts[0]),
+    static_cast<unsigned long>(parts[1]),
+    static_cast<unsigned long>(parts[2]),
+    static_cast<unsigned long>(parts[3])
+  );
+
+  return String(id);
+}
+
+String getDeviceId() {
+  if (isValidDeviceId(cachedDeviceId)) {
+    return cachedDeviceId;
+  }
+
+  Preferences prefs;
+  if (!prefs.begin(DEVICE_ID_NAMESPACE, false)) {
+    cachedDeviceId = generateDeviceId();
+    return cachedDeviceId;
+  }
+
+  cachedDeviceId = prefs.getString(DEVICE_ID_KEY, "");
+  if (!isValidDeviceId(cachedDeviceId)) {
+    cachedDeviceId = generateDeviceId();
+    prefs.putString(DEVICE_ID_KEY, cachedDeviceId);
+  }
+
+  prefs.end();
+  return cachedDeviceId;
 }
 
 void markPortalAwake() {
@@ -337,7 +403,9 @@ void handleHello() {
   }
 
   Serial.print(RESPONSE_PREFIX);
-  Serial.print("{\"ok\":true,\"type\":\"hello\",\"device\":\"AdventureCattoEink\",\"protocol\":1,");
+  Serial.print("{\"ok\":true,\"type\":\"hello\",\"device\":\"AdventureCattoEink\",\"protocol\":1,\"deviceId\":");
+  printJsonString(getDeviceId());
+  Serial.print(',');
   printStorageJson();
   Serial.println('}');
 }

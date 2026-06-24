@@ -87,10 +87,40 @@
           </thead>
           <tbody id="bookRows">
             <tr>
-              <td colspan="3" class="empty-row">No titles on device.</td>
+              <td colspan="3" class="empty-row">Connect device to load the library</td>
             </tr>
           </tbody>
         </table>
+      </section>
+
+      <section id="onlineLibrarySection" class="section library-section">
+        <div class="library-title-row">
+          <div class="section-title no-icon">
+            <span>Online Library</span>
+          </div>
+          <span id="onlineBookCount" class="title-count">0 Titles</span>
+        </div>
+
+        <div class="online-actions">
+          <button id="onlineAddButton" class="secondary-button" type="button">Add Title</button>
+          <span id="onlineStorageText">0 B free online</span>
+        </div>
+
+        <table class="library-table online-library-table">
+          <thead>
+            <tr>
+              <th>Title</th>
+              <th>Size</th>
+              <th class="action-heading"></th>
+            </tr>
+          </thead>
+          <tbody id="onlineBookRows">
+            <tr>
+              <td colspan="3" class="empty-row">Connect device to load online library</td>
+            </tr>
+          </tbody>
+        </table>
+        <input id="onlineFileInput" type="file" accept=".txt,.epub,.pdf,text/plain,application/epub+zip,application/pdf">
       </section>
 
       <section class="section upload-section">
@@ -127,6 +157,7 @@
 
     <script src="./vendor/jszip.min.js"></script>
     <script src="./vendor/pdf.min.js"></script>
+    <script src="./config.js"></script>
     <script src="./app.js"></script>
   </body>
 </html>

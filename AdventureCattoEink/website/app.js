@@ -9,6 +9,11 @@ const encoder = new TextEncoder();
 const decoder = new TextDecoder();
 const SUPPORTED_EXTENSIONS = new Set(["txt", "epub", "pdf"]);
 const PDF_TEXT_MIN_CHARS = 80;
+const ONLINE_LIBRARY_API_BASE = (
+  localStorage.getItem("adventureCattoApiBase")
+  || window.ADVENTURE_CATTO_ONLINE_LIBRARY_API_BASE
+  || ""
+).replace(/\/+$/, "");
 
 if (window.pdfjsLib) {
   window.pdfjsLib.GlobalWorkerOptions.workerSrc = "./vendor/pdf.worker.min.js";
@@ -25,8 +30,12 @@ let heartbeatTimer = 0;
 
 const pendingResponses = [];
 const state = {
+  deviceId: "",
   storage: null,
   books: [],
+  onlineStorage: null,
+  onlineBooks: [],
+  onlineAvailable: false,
 };
 
 const els = {
@@ -43,6 +52,12 @@ const els = {
   storageDetail: document.getElementById("storageDetail"),
   bookRows: document.getElementById("bookRows"),
   bookCount: document.getElementById("bookCount"),
+  onlineLibrarySection: document.getElementById("onlineLibrarySection"),
+  onlineBookRows: document.getElementById("onlineBookRows"),
+  onlineBookCount: document.getElementById("onlineBookCount"),
+  onlineStorageText: document.getElementById("onlineStorageText"),
+  onlineAddButton: document.getElementById("onlineAddButton"),
+  onlineFileInput: document.getElementById("onlineFileInput"),
   fileInput: document.getElementById("fileInput"),
   dropZone: document.getElementById("dropZone"),
   uploadProgress: document.getElementById("uploadProgress"),
@@ -88,6 +103,17 @@ els.fileInput.addEventListener("change", () => {
   const file = els.fileInput.files?.[0];
   if (file) {
     uploadFile(file);
+  }
+});
+
+els.onlineAddButton.addEventListener("click", () => {
+  els.onlineFileInput.click();
+});
+
+els.onlineFileInput.addEventListener("change", () => {
+  const file = els.onlineFileInput.files?.[0];
+  if (file) {
+    uploadFileToOnlineLibrary(file);
   }
 });
 
@@ -163,6 +189,8 @@ function setBusy(nextBusy) {
   els.connectButton.disabled = busy || !("serial" in navigator);
   els.portSelect.disabled = busy || Boolean(port) || !("serial" in navigator);
   els.fileInput.disabled = busy || !port;
+  els.onlineFileInput.disabled = busy || !state.onlineAvailable;
+  els.onlineAddButton.disabled = busy || !state.onlineAvailable;
   els.dropZone.classList.toggle("disabled", busy || !port);
   document.querySelectorAll(".row-action").forEach((button) => {
     button.disabled = busy || !port;
@@ -204,8 +232,10 @@ async function connectDevice(preselectedPort = null) {
     startHeartbeat();
     setStatus("Checking device...");
     await wait(250);
-    await sendCommand("ACAT HELLO", ["hello"], HANDSHAKE_TIMEOUT_MS);
+    const hello = await sendCommand("ACAT HELLO", ["hello"], HANDSHAKE_TIMEOUT_MS);
+    state.deviceId = hello.deviceId || "";
     await refreshLibrary(false);
+    await refreshOnlineLibrary(false);
     setStatus("Connected.", "good");
   } catch (error) {
     await disconnectDevice(false, false);
@@ -252,6 +282,8 @@ async function disconnectDevice(showStatus = true, notifyDevice = true) {
   reader = null;
   writer = null;
   lineBuffer = "";
+  state.deviceId = "";
+  resetOnlineLibrary();
   rejectPending("Disconnected.");
   setConnected(false);
 
@@ -464,17 +496,61 @@ async function deleteBook(book) {
 }
 
 async function uploadFile(file) {
-  let uploadStarted = false;
-
   try {
     if (!port) {
       throw new Error("Connect the device first.");
     }
 
-    const upload = await prepareUpload(file);
+    let upload = await prepareUpload(file);
+    let onlineSyncMessage = "";
+    let shouldSyncOnline = true;
+
+    if (canUseOnlineLibrary()) {
+      try {
+        const resolved = await resolveOnlineName(upload.name, upload.bytes.length);
+        upload = {
+          ...upload,
+          name: resolved.name,
+        };
+        if (resolved.canStore === false) {
+          shouldSyncOnline = false;
+          onlineSyncMessage = " Online library is full; uploaded to device only.";
+        }
+      } catch (error) {
+        shouldSyncOnline = false;
+        onlineSyncMessage = ` Online server is down: ${error.message || "could not reserve name"}.`;
+      }
+    }
+
     await ensureStorageFresh();
     validateStorageForUpload(upload);
 
+    await uploadPreparedToDevice(upload);
+
+    if (canUseOnlineLibrary() && shouldSyncOnline) {
+      try {
+        await uploadPreparedToOnlineLibrary(upload, false);
+      } catch (error) {
+        onlineSyncMessage = ` Online server is down: ${error.message || "backup failed"}.`;
+      }
+    }
+
+    setStatus(`Title uploaded.${onlineSyncMessage}`, onlineSyncMessage ? "bad" : "good");
+  } catch (error) {
+    setStatus(error.message || "Upload failed.", "bad");
+  } finally {
+    els.fileInput.value = "";
+    window.setTimeout(() => {
+      els.uploadProgress.hidden = true;
+    }, 900);
+    setBusy(false);
+  }
+}
+
+async function uploadPreparedToDevice(upload) {
+  let uploadStarted = false;
+
+  try {
     setBusy(true);
     showUploadProgress(0, "Starting");
 
@@ -493,19 +569,175 @@ async function uploadFile(file) {
 
     await sendCommand("ACAT END", ["list"], 15000);
     showUploadProgress(1, "Complete");
-    setStatus("Title uploaded.", "good");
   } catch (error) {
     if (uploadStarted) {
       sendCommand("ACAT CANCEL", ["cancel"], 3000).catch(() => {});
     }
-    setStatus(error.message || "Upload failed.", "bad");
+    throw error;
+  }
+}
+
+function canUseOnlineLibrary() {
+  return Boolean(ONLINE_LIBRARY_API_BASE && state.deviceId);
+}
+
+async function refreshOnlineLibrary(showMessage = true) {
+  if (!state.deviceId) {
+    resetOnlineLibrary();
+    return;
+  }
+
+  els.onlineLibrarySection.hidden = false;
+
+  if (!ONLINE_LIBRARY_API_BASE) {
+    state.onlineAvailable = false;
+    renderOnlineLibraryMessage("Online library is not configured.");
+    setBusy(false);
+    return;
+  }
+
+  try {
+    if (showMessage) {
+      setBusy(true);
+      setStatus("Reading online library...");
+    }
+    const data = await onlineJson(`/api/devices/${encodeURIComponent(state.deviceId)}/books`);
+    updateOnlineLibrary(data);
+    if (showMessage) {
+      setStatus("Online library refreshed.", "good");
+    }
+  } catch (error) {
+    state.onlineAvailable = false;
+    renderOnlineLibraryMessage(`Online server is down: ${error.message || "could not load library"}.`);
+    if (showMessage) {
+      setStatus("Online server is down.", "bad");
+    }
   } finally {
-    els.fileInput.value = "";
+    if (showMessage) {
+      setBusy(false);
+    }
+  }
+}
+
+async function resolveOnlineName(name, size) {
+  return onlineJson(`/api/devices/${encodeURIComponent(state.deviceId)}/books/resolve-name`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ name, size }),
+  });
+}
+
+async function uploadFileToOnlineLibrary(file) {
+  try {
+    if (!canUseOnlineLibrary()) {
+      throw new Error(ONLINE_LIBRARY_API_BASE ? "Connect the device first." : "Online library is not configured.");
+    }
+
+    const upload = await prepareUpload(file);
+    setBusy(true);
+    showUploadProgress(0, "Online");
+    const result = await uploadPreparedToOnlineLibrary(upload);
+    showUploadProgress(1, "Complete");
+    setStatus(`Added ${result.book.name} to online library.`, "good");
+  } catch (error) {
+    setStatus(error.message || "Online upload failed.", "bad");
+  } finally {
+    els.onlineFileInput.value = "";
     window.setTimeout(() => {
       els.uploadProgress.hidden = true;
     }, 900);
     setBusy(false);
   }
+}
+
+async function uploadPreparedToOnlineLibrary(upload) {
+  const form = new FormData();
+  form.append("name", upload.name);
+  form.append("file", new Blob([upload.bytes], { type: "text/plain" }), upload.name);
+
+  const result = await onlineJson(`/api/devices/${encodeURIComponent(state.deviceId)}/books`, {
+    method: "POST",
+    body: form,
+  });
+  updateOnlineLibrary(result);
+  return result;
+}
+
+async function uploadOnlineBookToDevice(book) {
+  try {
+    if (!port) {
+      throw new Error("Connect the device first.");
+    }
+
+    setBusy(true);
+    setStatus(`Downloading ${book.name}...`);
+    const response = await onlineFetch(`/api/devices/${encodeURIComponent(state.deviceId)}/books/${encodeURIComponent(book.id)}/content`);
+    const bytes = new Uint8Array(await response.arrayBuffer());
+    const upload = {
+      name: validateBookName(book.name),
+      bytes,
+    };
+
+    await ensureStorageFresh();
+    validateStorageForUpload(upload);
+    await uploadPreparedToDevice(upload);
+    setStatus("Online title uploaded to device.", "good");
+  } catch (error) {
+    setStatus(error.message || "Could not upload online title to device.", "bad");
+  } finally {
+    window.setTimeout(() => {
+      els.uploadProgress.hidden = true;
+    }, 900);
+    setBusy(false);
+  }
+}
+
+async function deleteOnlineBook(book) {
+  if (!window.confirm(`Delete "${book.name}" from the online library?`)) {
+    return;
+  }
+
+  try {
+    setBusy(true);
+    setStatus(`Deleting ${book.name} online...`);
+    const data = await onlineJson(`/api/devices/${encodeURIComponent(state.deviceId)}/books/${encodeURIComponent(book.id)}`, {
+      method: "DELETE",
+    });
+    updateOnlineLibrary(data);
+    setStatus("Online title deleted.", "good");
+  } catch (error) {
+    setStatus(error.message || "Online delete failed.", "bad");
+  } finally {
+    setBusy(false);
+  }
+}
+
+async function onlineFetch(path, options = {}) {
+  if (!ONLINE_LIBRARY_API_BASE) {
+    throw new Error("Online library is not configured.");
+  }
+
+  const response = await fetch(`${ONLINE_LIBRARY_API_BASE}${path}`, options);
+  if (!response.ok) {
+    let message = `Online server returned ${response.status}.`;
+    try {
+      const data = await response.clone().json();
+      message = data.message || message;
+    } catch (_) {
+    }
+    throw new Error(message);
+  }
+
+  return response;
+}
+
+async function onlineJson(path, options = {}) {
+  const response = await onlineFetch(path, options);
+  const data = await response.json();
+  if (!data.ok) {
+    throw new Error(data.message || "Online library rejected the request.");
+  }
+  return data;
 }
 
 async function prepareUpload(file) {
@@ -910,6 +1142,93 @@ function updateBooks(books) {
   renderStorage();
 }
 
+function resetOnlineLibrary() {
+  state.onlineStorage = null;
+  state.onlineBooks = [];
+  state.onlineAvailable = false;
+  els.onlineLibrarySection.hidden = false;
+  renderOnlineLibrary();
+}
+
+function updateOnlineLibrary(data) {
+  state.onlineStorage = data.quota || null;
+  state.onlineBooks = Array.isArray(data.books)
+    ? [...data.books].sort((a, b) => a.name.localeCompare(b.name))
+    : [];
+  state.onlineAvailable = true;
+  els.onlineLibrarySection.hidden = false;
+  renderOnlineLibrary();
+}
+
+function renderOnlineLibraryMessage(message) {
+  els.onlineLibrarySection.hidden = false;
+  els.onlineBookRows.replaceChildren();
+  const row = document.createElement("tr");
+  const cell = document.createElement("td");
+  cell.colSpan = 3;
+  cell.className = "empty-row";
+  cell.textContent = message;
+  row.append(cell);
+  els.onlineBookRows.append(row);
+  els.onlineBookCount.textContent = "0 Titles";
+  els.onlineStorageText.textContent = "Online unavailable";
+  setBusy(false);
+}
+
+function renderOnlineLibrary() {
+  const hasDevice = Boolean(state.deviceId);
+  els.onlineBookCount.textContent = `${state.onlineBooks.length} ${state.onlineBooks.length === 1 ? "Title" : "Titles"}`;
+  const quota = state.onlineStorage || { total: 0, used: 0, free: 0 };
+  els.onlineStorageText.textContent = hasDevice ? `${formatBytes(quota.free || 0)} free online` : "Connect device";
+  els.onlineBookRows.replaceChildren();
+
+  if (state.onlineBooks.length === 0) {
+    const row = document.createElement("tr");
+    const cell = document.createElement("td");
+    cell.colSpan = 3;
+    cell.className = "empty-row";
+    cell.textContent = state.onlineAvailable
+      ? "No online titles yet."
+      : hasDevice
+        ? "Online library unavailable."
+        : "Connect device to load online library.";
+    row.append(cell);
+    els.onlineBookRows.append(row);
+    return;
+  }
+
+  state.onlineBooks.forEach((book) => {
+    const row = document.createElement("tr");
+
+    const title = document.createElement("td");
+    title.textContent = displayTitle(book.name);
+
+    const size = document.createElement("td");
+    size.textContent = formatBytes(book.size);
+
+    const action = document.createElement("td");
+    action.className = "action-cell online-row-actions";
+
+    const uploadButton = document.createElement("button");
+    uploadButton.type = "button";
+    uploadButton.className = "row-action online-upload-action";
+    uploadButton.textContent = "Upload";
+    uploadButton.disabled = busy || !port || !state.onlineAvailable;
+    uploadButton.addEventListener("click", () => uploadOnlineBookToDevice(book));
+
+    const deleteButton = document.createElement("button");
+    deleteButton.type = "button";
+    deleteButton.className = "row-action";
+    deleteButton.textContent = "Delete";
+    deleteButton.disabled = busy || !state.onlineAvailable;
+    deleteButton.addEventListener("click", () => deleteOnlineBook(book));
+
+    action.append(uploadButton, deleteButton);
+    row.append(title, size, action);
+    els.onlineBookRows.append(row);
+  });
+}
+
 function displayTitle(name) {
   return name.replace(/\.txt$/i, "");
 }
@@ -1014,3 +1333,5 @@ function stopHeartbeat() {
 }
 
 renderStorage();
+resetOnlineLibrary();
+setBusy(false);

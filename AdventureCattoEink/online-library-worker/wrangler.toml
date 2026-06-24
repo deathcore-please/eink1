@@ -1,0 +1,6 @@
+name = "adventure-catto-library"
+main = "src/index.mjs"
+compatibility_date = "2026-06-24"
+
+[vars]
+ONLINE_LIBRARY_QUOTA_BYTES = "1073741824"

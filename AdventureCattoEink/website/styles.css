@@ -185,7 +185,20 @@ h1 {
   text-transform: uppercase;
 }
 
+.secondary-button {
+  height: 36px;
+  border: 1px solid #000;
+  background: #fff;
+  color: #000;
+  font-size: 12px;
+  font-weight: 700;
+  letter-spacing: 3px;
+  padding: 0 16px;
+  text-transform: uppercase;
+}
+
 .primary-button:disabled,
+.secondary-button:disabled,
 .row-action:disabled {
   cursor: not-allowed;
   opacity: 0.42;
@@ -267,10 +280,21 @@ h1 {
   letter-spacing: 4px;
 }
 
+.online-actions {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 18px;
+  margin: -8px 0 18px;
+  color: var(--muted);
+  font-size: 14px;
+}
+
 .library-table {
   width: 100%;
   border-collapse: collapse;
   border: 1px solid var(--line);
+  table-layout: fixed;
 }
 
 .library-table th,
@@ -301,17 +325,33 @@ h1 {
 
 .library-table th:nth-child(1),
 .library-table td:nth-child(1) {
-  width: 72%;
+  width: 52%;
 }
 
 .library-table th:nth-child(2),
 .library-table td:nth-child(2) {
-  width: 18%;
+  width: 16%;
 }
 
-.action-heading,
-.action-cell {
-  width: 10%;
+.library-table .action-heading,
+.library-table td.action-cell {
+  width: 32%;
+  text-align: right;
+}
+
+.online-library-table th:nth-child(1),
+.online-library-table td:nth-child(1) {
+  width: 52%;
+}
+
+.online-library-table th:nth-child(2),
+.online-library-table td:nth-child(2) {
+  width: 16%;
+}
+
+.online-library-table .action-heading,
+.online-library-table .action-cell {
+  width: 32%;
 }
 
 .row-action {
@@ -325,6 +365,20 @@ h1 {
   text-transform: uppercase;
 }
 
+.library-table td.online-row-actions {
+  text-align: right;
+  white-space: nowrap;
+}
+
+.online-row-actions .row-action {
+  display: inline-block;
+  margin-left: 18px;
+}
+
+.online-upload-action {
+  color: #000;
+}
+
 .library-table tr:hover .row-action,
 .row-action:focus {
   opacity: 1;
@@ -336,6 +390,7 @@ h1 {
   text-align: center !important;
 }
 
+#onlineFileInput,
 #fileInput {
   position: absolute;
   width: 1px;
@@ -544,6 +599,13 @@ h1 {
   .title-count {
     display: block;
     margin: -8px 0 22px;
+    text-align: center;
+  }
+
+  .online-actions {
+    align-items: stretch;
+    flex-direction: column;
+    margin-top: -4px;
     text-align: center;
   }
 

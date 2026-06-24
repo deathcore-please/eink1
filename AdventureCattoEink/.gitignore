@@ -1,0 +1,7 @@
+node_modules/
+.pnpm-store/
+online-library-worker/node_modules/
+online-library-worker/.wrangler/
+online-library-worker/.wrangler-state/
+online-library-worker/.dev.vars
+online-library-worker/.env
