@@ -8,6 +8,7 @@
 #include <sys/time.h>
 #include <time.h>
 #include <stdio.h>
+#include <Preferences.h>
 
 #include "animations.h"
 #include "idle_animation.h"
@@ -21,20 +22,26 @@
 #include "sad_pet_animation.h"
 #include "sleeping_animation.h"
 #include "deep_sleep_splashes.h"
+#include "delivery_intro_animation.h"
 #include "menu_cat_icon.h"
 #include "menu_reader_icon.h"
 #include "EreaderApp.h"
 #include "SerialLibraryPortal.h"
 #include "library_portal_image.h"
+#include "PetNeeds.h"
+#include "PetStateStore.h"
+#include "PetTrace.h"
+#include <esp_system.h>
+#include "CareNotificationText.h"
 
 extern uint8_t ImageBW[ALLSCREEN_BYTES];
 
-// Board input pins from Elecrow example
-#define HOME_KEY 2
+// Button roles: toggle press = home, top button = OK.
+#define HOME_KEY 5
 #define EXIT_KEY 1
 #define PRV_KEY  6
 #define NEXT_KEY 4
-#define OK_KEY   5
+#define OK_KEY   2
 
 // Button meanings for this version
 #define MAIN_TOGGLE_KEY OK_KEY
@@ -63,22 +70,18 @@ extern uint8_t ImageBW[ALLSCREEN_BYTES];
 #define ISR_DEBOUNCE_US 50000
 #define DIRECTION_REARM_MS 70
 
-// Need/meter settings
-// Time for a full (100 -> 0) bar to drain, per need.
-#define PEE_FULL_DRAIN_SECONDS  (6UL * 3600UL)
-#define FOOD_FULL_DRAIN_SECONDS (4UL * 3600UL)
-#define PLAY_FULL_DRAIN_SECONDS (6UL * 3600UL)
-#define PET_FULL_DRAIN_SECONDS  (3UL * 3600UL)
-#define NEED_MAX_VALUE 100UL
-#define NEED_SAD_THRESHOLD 10
-#define HAPPINESS_CRISIS_SECONDS_PER_POINT_PER_NEED (45UL * 60UL)
+// Need drain rates and happiness weights live in PetNeeds.h / PetNeeds.cpp.
+#define DELIVERY_INTRO_REFRESH_PAUSE_MS 2000UL
+#define DELIVERY_INTRO_LAST_FRAME_HOLD_MS 4000UL
 
 // Deep sleep settings
 #define SLEEP_ANIMATION_TIMEOUT_MS 15000
 #define INACTIVITY_TIMEOUT_MS 30000
 #define MENU_BUTTON_DEBOUNCE_MS 30
-#define RTC_PET_STATE_MAGIC 0xCA77000FUL
-#define RTC_SPLASH_ROTATION_MAGIC 0x5A1A5001UL
+#define RTC_PET_STATE_MAGIC 0xCA770011UL
+#define PET_CHECKPOINT_INTERVAL_MS (5UL * 60UL * 1000UL)
+#define PET_CHECKPOINT_RETRY_MS 5000UL
+#define RTC_SPLASH_ROTATION_MAGIC 0x5A1A5002UL
 #define WAKE_BUTTON_PIN_MASK ((1ULL << EXIT_KEY) | (1ULL << HOME_KEY) | (1ULL << NEXT_KEY) | (1ULL << OK_KEY) | (1ULL << PRV_KEY))
 
 // Local hour offset from UTC (seconds). Adjust for your timezone.
@@ -120,6 +123,7 @@ extern uint8_t ImageBW[ALLSCREEN_BYTES];
 #define SLEEP_CD_SHORT_SEC (2UL * 3600UL)
 #define SLEEP_CD_LONG_SEC (4UL * 3600UL)
 #define SLEEP_WAKE_WINDOW_SEC (30UL * 60UL)
+#define SLEEP_START_OK_LOCKOUT_MS 2000UL
 
 // Action cooldowns after performing pee/food/play (seconds)
 #define PEE_CD_SEC (1UL * 3600UL)
@@ -163,6 +167,8 @@ extern uint8_t ImageBW[ALLSCREEN_BYTES];
 #define HOME_EREADER_X (HOME_TAMAGOTCHI_X + HOME_TILE_W + HOME_TILE_GAP)
 
 // Top-right age label
+#define DEFAULT_PET_START_AGE_DAYS 15UL
+#define ONE_TIME_PET_START_AGE_DAYS 17UL
 #define AGE_TEXT_SIZE 12
 #define AGE_LABEL_MAX_CHARS 22
 #define AGE_LABEL_PAD 2
@@ -171,8 +177,6 @@ extern uint8_t ImageBW[ALLSCREEN_BYTES];
 #define AGE_LABEL_X (SCREEN_W - AGE_LABEL_W)
 #define AGE_LABEL_Y 0
 
-#define INTRO_PLACEHOLDER_MS 2500
-#define INTRO_TEXT_SIZE 16
 #define RUNAWAY_TEXT_MARGIN 4
 
 static const char RUNAWAY_MESSAGE[] =
@@ -199,7 +203,8 @@ enum PetMode {
   PET_INTRO,
   PET_SLEEP_SELECT,
   PET_SLEEPING,
-  PET_COOLDOWN_MSG
+  PET_COOLDOWN_MSG,
+  PET_CARE_NOTICE
 };
 
 enum SelectedAction {
@@ -233,6 +238,12 @@ enum InputEvent {
   INPUT_DOWN
 };
 
+enum PetStateRestoreSource {
+  PET_STATE_FRESH,
+  PET_STATE_RTC,
+  PET_STATE_CHECKPOINT
+};
+
 AppMode appMode = APP_TAMAGOTCHI;
 HomeOption homeSelection = HOME_OPTION_TAMAGOTCHI;
 PetMode petMode = PET_IDLE;
@@ -256,19 +267,33 @@ unsigned long upReleasedSinceMs = 0;
 unsigned long downReleasedSinceMs = 0;
 bool discardWakeInput = false;
 bool forceFullRefreshNextFrame = false;
+bool eraseFullScreenNextSpriteFrame = false;
 bool serialPortalDisplayActive = false;
 bool serialPortalPreviousInputCaptureLocked = false;
 bool hasSeenDeliveryIntro = false;
 bool pendingRunaway = false;
-unsigned long introStartedMs = 0;
+const char* runawayDiagnosticReason = "none";
+esp_sleep_wakeup_cause_t lastWakeCause = ESP_SLEEP_WAKEUP_UNDEFINED;
+RTC_DATA_ATTR uint8_t rtcRunawayDeathLogged = 0;
+bool petCheckpointDirty = false;
+unsigned long lastPetCheckpointMs = 0;
 
 void resetNeedDrainClock();
-void updateHappiness(uint32_t elapsedSeconds);
+void updateHappiness();
+bool hasRunawayCriticalNeed();
+bool shouldShowRunaway();
+void logRunawayDeathIfNeeded(const char* reason);
 void startIdle();
 void startPetAgeTimerIfNeeded();
 void resetPetAgeTimer();
+void savePetStateCheckpoint();
+void servicePetStateCheckpoint();
+PetStateRestoreSource restorePetStateForBoot(esp_sleep_wakeup_cause_t wakeCause);
+PetTrace::Frame capturePetTraceFrame();
+void tracePetEvent(const char* event, const char* detail = "");
 void showRunawayScreen();
 void maybeTriggerRunaway();
+void advanceDeliveryIntroAnimation();
 void enterHomeScreen();
 bool isSleepOnCooldown();
 void drawSleepRow();
@@ -282,38 +307,12 @@ bool isActionOnCooldown(SelectedAction action);
 void openCooldownDialog(SelectedAction action);
 void drawCooldownDialog();
 void closeCooldownDialog();
+bool showNextCareNotice();
+void drawCareNoticeScreen();
+void acknowledgeCareNotice();
+void loopCareNotice();
 
-RTC_DATA_ATTR struct {
-  uint32_t magic;
-  uint8_t peeValue;
-  uint8_t foodValue;
-  uint8_t playValue;
-  uint8_t loveValue;
-  uint8_t activeSadNeed;
-  uint8_t selectedAction;
-  uint8_t appMode;
-  uint8_t homeSelection;
-  uint8_t petAgeStarted;
-  uint32_t epochSeconds;
-  uint64_t epochSetUs;
-  uint32_t petBirthEpoch;
-  uint32_t sleepEntryEpoch;
-  uint32_t lastNeedDrainEpoch;
-  uint32_t peeDrainCarry;
-  uint32_t foodDrainCarry;
-  uint32_t playDrainCarry;
-  uint32_t loveDrainCarry;
-  uint8_t happinessValue;
-  uint32_t happinessCrisisCarry;
-  uint8_t hasSeenDeliveryIntro;
-  uint8_t sleeping;
-  uint32_t sleepStartEpoch;
-  uint32_t sleepDurationSec;
-  uint32_t sleepCooldownUntilEpoch;
-  uint32_t peeCooldownUntilEpoch;
-  uint32_t foodCooldownUntilEpoch;
-  uint32_t playCooldownUntilEpoch;
-} rtcPetState;
+RTC_DATA_ATTR PetStateStore::Snapshot rtcPetState;
 
 RTC_DATA_ATTR struct {
   uint32_t magic;
@@ -335,12 +334,18 @@ uint32_t foodDrainCarry = 0;
 uint32_t playDrainCarry = 0;
 uint32_t loveDrainCarry = 0;
 uint32_t happinessCrisisCarry = 0;
+uint8_t happinessCrisisPenalty = 0;
+PetCare::State careState = {};
+PetCare::Notice currentCareNotice = {};
+bool careNoticeAwaitRelease = false;
+unsigned long careNoticeReleasedSinceMs = 0;
 
 // User-initiated sleep state
 uint32_t sleepStartEpoch = 0;
 uint32_t sleepDurationSec = 0;
 uint32_t sleepCooldownUntilEpoch = 0;
 uint8_t sleepDialogChoice = 0;
+unsigned long sleepOkIgnoredUntilMs = 0;
 bool sleepWakeButtonShown = false;
 
 // Action cooldown state
@@ -850,11 +855,31 @@ void selectActivityMessage(const char* const messages[], uint8_t count) {
 }
 
 void resetPetAgeTimer() {
-  // Reset hook for handoff: call this before delivery to start the pet age at zero.
+  // The next intro starts a new age timer using the configured starting age.
   petAgeStarted = false;
   petBirthEpoch = 0;
   rtcPetState.petAgeStarted = 0;
   rtcPetState.petBirthEpoch = 0;
+}
+
+uint32_t consumeStartingPetAgeDays() {
+  Preferences prefs;
+  uint32_t days = DEFAULT_PET_START_AGE_DAYS;
+  if (!prefs.begin("pet-age", false)) {
+    Serial.println("Age override unavailable; using the normal starting age");
+    return days;
+  }
+  // Consume only once, after the first intro. Reboots and normal uploads must
+  // not grant the 17-day starting age to another life.
+  if (!prefs.getBool("start17-used", false)) {
+    if (prefs.putBool("start17-used", true) == 1) {
+      days = ONE_TIME_PET_START_AGE_DAYS;
+    } else {
+      Serial.println("Age override could not be saved; using the normal starting age");
+    }
+  }
+  prefs.end();
+  return days;
 }
 
 void startPetAgeTimerIfNeeded() {
@@ -862,7 +887,7 @@ void startPetAgeTimerIfNeeded() {
     return;
   }
 
-  petBirthEpoch = (uint32_t)time(NULL);
+  petBirthEpoch = (uint32_t)time(NULL) - (consumeStartingPetAgeDays() * 24UL * 3600UL);
   petAgeStarted = true;
   rtcPetState.petAgeStarted = 1;
   rtcPetState.petBirthEpoch = petBirthEpoch;
@@ -1186,15 +1211,21 @@ void closeCooldownDialog() {
 }
 
 void resetPetLifeState() {
+  tracePetEvent("life_reset_before");
+  careState = {};
+  careNoticeAwaitRelease = false;
   peeValue = 80;
   foodValue = 80;
   playValue = 80;
   loveValue = 80;
   happinessValue = 80;
   happinessCrisisCarry = 0;
+  happinessCrisisPenalty = 0;
   activeSadNeed = SAD_NEED_NONE;
   selectedAction = ACTION_PEE;
   pendingRunaway = false;
+  runawayDiagnosticReason = "reset_pet_life_state";
+  rtcRunawayDeathLogged = 0;
   hasSeenDeliveryIntro = false;
   sleepStartEpoch = 0;
   sleepDurationSec = 0;
@@ -1205,11 +1236,58 @@ void resetPetLifeState() {
   playCooldownUntilEpoch = 0;
   resetPetAgeTimer();
   resetNeedDrainClock();
-  updateHappiness(0);
+  updateHappiness();
+  tracePetEvent("life_reset_after");
+}
+
+void logRunawayDeathIfNeeded(const char* reason) {
+  if (rtcRunawayDeathLogged != 0) {
+    return;
+  }
+
+  const char* loggedReason = reason;
+  if (happinessValue > 0 || !hasRunawayCriticalNeed()) {
+    loggedReason = "unexpected_runaway_show";
+  } else if (loggedReason == nullptr || loggedReason[0] == '\0' || strcmp(loggedReason, "none") == 0) {
+    loggedReason = pendingRunaway ? "pending_runaway_displayed" : "happiness_zero_food_or_pee";
+  }
+
+  rtcRunawayDeathLogged = 1;
+  serialLibraryPortalAppendDeathLog(
+    loggedReason,
+    (uint32_t)time(NULL),
+    millis(),
+    (int)lastWakeCause,
+    (int)appMode,
+    (int)petMode,
+    (int)activeAction,
+    pendingRunaway,
+    happinessValue,
+    peeValue,
+    foodValue,
+    playValue,
+    loveValue,
+    lastNeedDrainEpoch,
+    peeDrainCarry,
+    foodDrainCarry,
+    playDrainCarry,
+    loveDrainCarry,
+    happinessCrisisCarry,
+    happinessCrisisPenalty,
+    sleepDurationSec > 0 && (uint32_t)time(NULL) < sleepStartEpoch + sleepDurationSec,
+    sleepStartEpoch,
+    sleepDurationSec,
+    careState
+  );
 }
 
 void showRunawayScreen() {
+  tracePetEvent("runaway_display", runawayDiagnosticReason);
+  logRunawayDeathIfNeeded(runawayDiagnosticReason);
+  pendingRunaway = false;
+
   petMode = PET_RAN_AWAY;
+  petCheckpointDirty = true;
   activeAction = ACTIVE_NONE;
   currentActivityMessage = "";
   clearInputQueue();
@@ -1232,45 +1310,70 @@ void showRunawayScreen() {
   Serial.println("Runaway screen shown");
 }
 
-void showIntroPlaceholder() {
+void startDeliveryIntro() {
   petMode = PET_INTRO;
   activeAction = ACTIVE_NONE;
   currentActivityMessage = "";
-  introStartedMs = millis();
+  currentAnimation = &deliveryIntroAnimation;
+  currentFrame = 0;
   inputCaptureLocked = true;
+  forceFullRefreshNextFrame = false;
   clearInputQueue();
 
   EPD_Init();
   clearImageBuffer();
-
-  const char* label = "animation";
-  int charW = INTRO_TEXT_SIZE / 2;
-  int textW = (int)strlen(label) * charW;
-  int x = (SCREEN_W - textW) / 2;
-  int y = (SCREEN_H - INTRO_TEXT_SIZE) / 2;
-  if (x < 0) {
-    x = 0;
-  }
-  if (y < 0) {
-    y = 0;
-  }
-  EPD_ShowString(x, y, label, BLACK, INTRO_TEXT_SIZE);
   fullRefresh();
+  delay(DELIVERY_INTRO_REFRESH_PAUSE_MS);
+
+  lastFrameMs = millis();
+  drawAnimationFrame(
+    currentAnimation,
+    getAnimationFrame(currentAnimation, currentFrame)
+  );
 
   lastActivityMs = millis();
-  Serial.println("Delivery intro placeholder started");
+  Serial.println("Delivery intro animation started");
 }
 
 void completeDeliveryIntro() {
   hasSeenDeliveryIntro = true;
   rtcPetState.hasSeenDeliveryIntro = 1;
+  resetNeedDrainClock();
+  PetNeeds::State state = captureNeedState();
+  PetNeeds::observeCare(state, lastNeedDrainEpoch);
+  applyNeedState(state);
   inputCaptureLocked = false;
   clearInputQueue();
   inputLockoutUntil = millis() + 100;
   startPetAgeTimerIfNeeded();
-  forceFullRefreshNextFrame = true;
+  savePetStateCheckpoint();
+  tracePetEvent("intro_completed");
+  eraseFullScreenNextSpriteFrame = true;
   startIdle();
   Serial.println("Delivery intro complete");
+}
+
+uint32_t getDeliveryIntroCurrentFrameHoldMs() {
+  if (currentFrame >= DELIVERY_INTRO_FRAME_COUNT - 2) {
+    return DELIVERY_INTRO_LAST_FRAME_HOLD_MS;
+  }
+
+  return currentAnimation->frameHoldMs;
+}
+
+void advanceDeliveryIntroAnimation() {
+  currentFrame++;
+
+  if (currentFrame >= DELIVERY_INTRO_FRAME_COUNT) {
+    completeDeliveryIntro();
+    return;
+  }
+
+  drawAnimationFrame(
+    currentAnimation,
+    getAnimationFrame(currentAnimation, currentFrame)
+  );
+  lastActivityMs = millis();
 }
 
 void onRunawayAcknowledged() {
@@ -1279,6 +1382,15 @@ void onRunawayAcknowledged() {
 }
 
 void enterTamagotchiInitialScreen() {
+  if (shouldShowRunaway() || petMode == PET_RAN_AWAY) {
+    showRunawayScreen();
+    return;
+  }
+
+  if (hasSeenDeliveryIntro && showNextCareNotice()) {
+    return;
+  }
+
   // Resume an in-progress user-initiated sleep (e.g. after deep sleep).
   if (sleepDurationSec > 0) {
     uint32_t nowEpoch = (uint32_t)time(NULL);
@@ -1302,29 +1414,106 @@ void enterTamagotchiInitialScreen() {
     return;
   }
 
-  if (petMode == PET_RAN_AWAY) {
-    showRunawayScreen();
-    return;
-  }
-
   if (petMode == PET_INTRO) {
-    showIntroPlaceholder();
-    return;
-  }
-
-  if (pendingRunaway || happinessValue == 0) {
-    pendingRunaway = false;
-    showRunawayScreen();
+    startDeliveryIntro();
     return;
   }
 
   if (!hasSeenDeliveryIntro) {
-    showIntroPlaceholder();
+    startDeliveryIntro();
     return;
   }
 
   startPetAgeTimerIfNeeded();
   startIdle();
+}
+
+void drawCareNoticeScreen() {
+  inputCaptureLocked = true;
+  clearAllPendingInput();
+  careNoticeAwaitRelease = true;
+  careNoticeReleasedSinceMs = 0;
+  EPD_Init();
+  clearImageBuffer();
+  const char* heading = CareNotificationText::heading(currentCareNotice.category);
+  uint16_t headingWidth = static_cast<uint16_t>(strlen(heading) * 8 + 1);
+  EPD_ShowStringBold16(static_cast<uint16_t>(SCREEN_W - 6 - headingWidth), 6, heading, BLACK);
+  drawWrappedFullScreenMessage(
+    CareNotificationText::message(currentCareNotice), 12, 6, 30, SCREEN_W - 12
+  );
+  fullRefresh();
+  clearAllPendingInput();
+  lastActivityMs = millis();
+}
+
+bool showNextCareNotice() {
+  if (!PetCare::nextNotice(careState, currentCareNotice)) {
+    return false;
+  }
+  petMode = PET_CARE_NOTICE;
+  activeAction = ACTIVE_NONE;
+  currentActivityMessage = "";
+  drawCareNoticeScreen();
+  return true;
+}
+
+void acknowledgeCareNotice() {
+  // Finish all elapsed time at the old rate, then revalidate the visible notice.
+  drainNeedsOverTime();
+  if (petMode != PET_CARE_NOTICE) {
+    return;
+  }
+  PetCare::acknowledge(careState, currentCareNotice);
+  rtcPetState.care = careState;
+  savePetStateCheckpoint();
+  tracePetEvent("care_notice_acknowledged");
+  if (showNextCareNotice()) {
+    return;
+  }
+
+  inputCaptureLocked = false;
+  careNoticeAwaitRelease = false;
+  clearAllPendingInput();
+  discardWakeInput = true;
+  forceFullRefreshNextFrame = true;
+  enterTamagotchiInitialScreen();
+  clearAllPendingInput();
+  lastActivityMs = millis();
+}
+
+void loopCareNotice() {
+  drainNeedsOverTime();
+  if (petMode != PET_CARE_NOTICE) {
+    return;
+  }
+  if (careNoticeAwaitRelease) {
+    clearAllPendingInput();
+    if (!allButtonsReleased()) {
+      careNoticeReleasedSinceMs = 0;
+    } else if (careNoticeReleasedSinceMs == 0) {
+      careNoticeReleasedSinceMs = millis();
+    } else if (millis() - careNoticeReleasedSinceMs >= DIRECTION_REARM_MS) {
+      resetMainInputState();
+      discardWakeInput = false;
+      careNoticeAwaitRelease = false;
+      inputCaptureLocked = false;
+    }
+  } else {
+    updateMenuButtonInput();
+    if (appMode != APP_TAMAGOTCHI) {
+      return;
+    }
+    InputEvent event = popInputEvent();
+    if (event == INPUT_MAIN) {
+      lastActivityMs = millis();
+      acknowledgeCareNotice();
+      return;
+    }
+    // Back and directional buttons cannot dismiss or apply a notice.
+  }
+  if (millis() - lastActivityMs >= INACTIVITY_TIMEOUT_MS && allButtonsReleased()) {
+    enterDeepSleep();
+  }
 }
 
 void drawSelectedTileFrame(int x, int y, int w, int h, bool selected) {
@@ -1434,10 +1623,44 @@ const uint8_t* getAnimationFrame(const Animation* anim, uint8_t index) {
   return (const uint8_t*)pgm_read_ptr(&anim->frames[index]);
 }
 
+void getSpriteDrawBox(const Animation* anim, int& drawX, int& drawY, int& drawW, int& drawH, int& minEraseY) {
+  if (anim == &deliveryIntroAnimation) {
+    drawW = SCREEN_W;
+    drawH = SCREEN_H;
+    drawX = (SCREEN_W - drawW) / 2;
+    drawY = (SCREEN_H - drawH) / 2;
+    minEraseY = 0;
+    return;
+  }
+
+  drawX = ANIMATION_BOX_X;
+  drawY = ANIMATION_BOX_Y;
+  drawW = ANIMATION_BOX_W;
+  drawH = ANIMATION_BOX_H;
+  minEraseY = 24;
+}
+
 void eraseSpriteArea(const Animation* anim) {
-  for (int y = ANIMATION_BOX_Y - 2; y < ANIMATION_BOX_Y + ANIMATION_BOX_H + 2; y++) {
-    for (int x = ANIMATION_BOX_X - 2; x < ANIMATION_BOX_X + ANIMATION_BOX_W + 2; x++) {
-      if (x >= 0 && x < SCREEN_W && y >= 24 && y < SCREEN_H) {
+  int drawX = 0;
+  int drawY = 0;
+  int drawW = 0;
+  int drawH = 0;
+  int minEraseY = 0;
+
+  if (eraseFullScreenNextSpriteFrame) {
+    drawX = 0;
+    drawY = 0;
+    drawW = SCREEN_W;
+    drawH = SCREEN_H;
+    minEraseY = 0;
+    eraseFullScreenNextSpriteFrame = false;
+  } else {
+    getSpriteDrawBox(anim, drawX, drawY, drawW, drawH, minEraseY);
+  }
+
+  for (int y = drawY - 2; y < drawY + drawH + 2; y++) {
+    for (int x = drawX - 2; x < drawX + drawW + 2; x++) {
+      if (x >= 0 && x < SCREEN_W && y >= minEraseY && y < SCREEN_H) {
         EPD_DrawPoint(x, y, WHITE);
       }
     }
@@ -1487,13 +1710,20 @@ bool getSpritePixel(const uint8_t* sprite, const Animation* anim, int x, int y) 
 }
 
 void drawSprite(const uint8_t* sprite, const Animation* anim) {
-  for (int y = 0; y < ANIMATION_BOX_H; y++) {
-    int sampleY = (y * anim->height) / ANIMATION_BOX_H;
+  int drawX = 0;
+  int drawY = 0;
+  int drawW = 0;
+  int drawH = 0;
+  int minEraseY = 0;
+  getSpriteDrawBox(anim, drawX, drawY, drawW, drawH, minEraseY);
 
-    for (int x = 0; x < ANIMATION_BOX_W; x++) {
-      int sampleX = (x * anim->width) / ANIMATION_BOX_W;
+  for (int y = 0; y < drawH; y++) {
+    int sampleY = (y * anim->height) / drawH;
+
+    for (int x = 0; x < drawW; x++) {
+      int sampleX = (x * anim->width) / drawW;
       bool pixelOn = getSpritePixel(sprite, anim, sampleX, sampleY);
-      EPD_DrawPoint(ANIMATION_BOX_X + x, ANIMATION_BOX_Y + y, pixelOn ? BLACK : WHITE);
+      EPD_DrawPoint(drawX + x, drawY + y, pixelOn ? BLACK : WHITE);
     }
   }
 }
@@ -1542,8 +1772,7 @@ void drawSerialPortalConnectedScreen() {
 void redrawTamagotchiAfterSerialPortal() {
   forceFullRefreshNextFrame = true;
 
-  if ((pendingRunaway || happinessValue == 0) && petMode != PET_RAN_AWAY) {
-    pendingRunaway = false;
+  if (shouldShowRunaway() && petMode != PET_RAN_AWAY) {
     showRunawayScreen();
     return;
   }
@@ -1564,7 +1793,16 @@ void redrawTamagotchiAfterSerialPortal() {
   }
 
   if (petMode == PET_INTRO) {
-    showIntroPlaceholder();
+    startDeliveryIntro();
+    return;
+  }
+
+  if (petMode == PET_CARE_NOTICE) {
+    if (!showNextCareNotice()) {
+      inputCaptureLocked = false;
+      discardWakeInput = true;
+      enterTamagotchiInitialScreen();
+    }
     return;
   }
 
@@ -1580,6 +1818,7 @@ void enterSerialPortalDisplay() {
   }
 
   serialPortalDisplayActive = true;
+  tracePetEvent("usb_connected");
   serialPortalPreviousInputCaptureLocked = inputCaptureLocked;
   inputCaptureLocked = true;
   clearAllPendingInput();
@@ -1598,6 +1837,7 @@ void exitSerialPortalDisplay() {
   }
 
   serialPortalDisplayActive = false;
+  tracePetEvent("usb_disconnected");
   inputCaptureLocked = serialPortalPreviousInputCaptureLocked;
   clearAllPendingInput();
 
@@ -1664,7 +1904,7 @@ bool hasSadAnimationForNeed(SadNeed need) {
 }
 
 bool isSadNeedLow(SadNeed need) {
-  return hasSadAnimationForNeed(need) && valueForSadNeed(need) < NEED_SAD_THRESHOLD;
+  return hasSadAnimationForNeed(need) && valueForSadNeed(need) < PetNeeds::SadThreshold;
 }
 
 SadNeed firstExistingLowNeed() {
@@ -1685,59 +1925,6 @@ SadNeed firstExistingLowNeed() {
   }
 
   return SAD_NEED_NONE;
-}
-
-void considerSadNeedCrossing(
-  SadNeed need,
-  uint8_t previousValue,
-  uint32_t drain,
-  uint32_t fullDrainSeconds,
-  SadNeed* bestNeed,
-  uint64_t* bestCrossKey
-) {
-  if (!hasSadAnimationForNeed(need)) {
-    return;
-  }
-
-  if (previousValue < NEED_SAD_THRESHOLD || drain == 0) {
-    return;
-  }
-
-  uint8_t nextValue = previousValue > drain ? previousValue - drain : 0;
-  if (nextValue >= NEED_SAD_THRESHOLD) {
-    return;
-  }
-
-  // Rank by approximate time-to-cross so the need that actually hit the
-  // threshold first (in wall-clock terms) wins, even with different rates.
-  // seconds-per-point is fullDrainSeconds/100; the common /100 is dropped.
-  uint32_t pointsToCross = previousValue - (NEED_SAD_THRESHOLD - 1);
-  uint64_t crossKey = (uint64_t)pointsToCross * fullDrainSeconds;
-  if (crossKey < *bestCrossKey) {
-    *bestCrossKey = crossKey;
-    *bestNeed = need;
-  }
-}
-
-SadNeed firstNeedCrossedByDrain(
-  uint8_t previousPee,
-  uint8_t previousFood,
-  uint8_t previousPlay,
-  uint8_t previousPets,
-  uint32_t peeTicks,
-  uint32_t foodTicks,
-  uint32_t playTicks,
-  uint32_t loveTicks
-) {
-  SadNeed bestNeed = SAD_NEED_NONE;
-  uint64_t bestCrossKey = UINT64_MAX;
-
-  considerSadNeedCrossing(SAD_NEED_PEE, previousPee, peeTicks, PEE_FULL_DRAIN_SECONDS, &bestNeed, &bestCrossKey);
-  considerSadNeedCrossing(SAD_NEED_FOOD, previousFood, foodTicks, FOOD_FULL_DRAIN_SECONDS, &bestNeed, &bestCrossKey);
-  considerSadNeedCrossing(SAD_NEED_PLAY, previousPlay, playTicks, PLAY_FULL_DRAIN_SECONDS, &bestNeed, &bestCrossKey);
-  considerSadNeedCrossing(SAD_NEED_PETS, previousPets, loveTicks, PET_FULL_DRAIN_SECONDS, &bestNeed, &bestCrossKey);
-
-  return bestNeed;
 }
 
 void refreshSadNeedAfterNeedChange(SadNeed newlyLowNeed) {
@@ -1801,80 +1988,117 @@ bool syncIdleAnimationToNeeds() {
   return true;
 }
 
-uint32_t computeNeedTicks(uint32_t elapsedSeconds, uint32_t fullDrainSeconds, uint32_t& carry) {
-  uint64_t units = (uint64_t)elapsedSeconds * NEED_MAX_VALUE + carry;
-  uint32_t ticks = (uint32_t)(units / fullDrainSeconds);
-  carry = (uint32_t)(units % fullDrainSeconds);
-  return ticks;
+PetNeeds::State captureNeedState() {
+  return {
+    {
+      {peeValue, peeDrainCarry, peeCooldownUntilEpoch},
+      {foodValue, foodDrainCarry, foodCooldownUntilEpoch},
+      {playValue, playDrainCarry, playCooldownUntilEpoch},
+      {loveValue, loveDrainCarry, 0}
+    },
+    happinessValue, happinessCrisisPenalty, happinessCrisisCarry, hasSeenDeliveryIntro,
+    careState
+  };
 }
 
-uint8_t computeHappinessFromNeeds() {
-  uint16_t sum = 4u * foodValue + 3u * peeValue + 2u * playValue + 1u * loveValue;
-  return (uint8_t)((sum + 5) / 10);
+void applyNeedState(const PetNeeds::State& state) {
+  peeValue = state.needs[PetNeeds::Pee].value;
+  foodValue = state.needs[PetNeeds::Food].value;
+  playValue = state.needs[PetNeeds::Play].value;
+  loveValue = state.needs[PetNeeds::Pets].value;
+  peeDrainCarry = state.needs[PetNeeds::Pee].drainCarry;
+  foodDrainCarry = state.needs[PetNeeds::Food].drainCarry;
+  playDrainCarry = state.needs[PetNeeds::Play].drainCarry;
+  loveDrainCarry = state.needs[PetNeeds::Pets].drainCarry;
+  peeCooldownUntilEpoch = state.needs[PetNeeds::Pee].cooldownUntilEpoch;
+  foodCooldownUntilEpoch = state.needs[PetNeeds::Food].cooldownUntilEpoch;
+  playCooldownUntilEpoch = state.needs[PetNeeds::Play].cooldownUntilEpoch;
+  happinessValue = state.happiness;
+  happinessCrisisPenalty = state.crisisPenalty;
+  happinessCrisisCarry = state.crisisCarry;
+  careState = state.care;
 }
 
-uint8_t countZeroNeeds() {
-  uint8_t count = 0;
-  if (foodValue == 0) {
-    count++;
-  }
-  if (loveValue == 0) {
-    count++;
-  }
-  if (playValue == 0) {
-    count++;
-  }
-  if (peeValue == 0) {
-    count++;
-  }
-  return count;
+bool hasRunawayCriticalNeed() {
+  return foodValue == 0 || peeValue == 0;
 }
 
-void updateHappiness(uint32_t elapsedSeconds) {
-  uint8_t weighted = computeHappinessFromNeeds();
-  uint8_t zeroNeeds = countZeroNeeds();
+PetTrace::Frame capturePetTraceFrame() {
+  PetTrace::Frame frame = {};
+  frame.epoch = (uint32_t)time(NULL);
+  frame.millis = (uint32_t)millis();
+  frame.uptimeUs = (uint64_t)esp_timer_get_time();
+  frame.lastDrainEpoch = lastNeedDrainEpoch;
+  frame.rtcEpoch = rtcPetState.epochSeconds;
+  frame.rtcDrainEpoch = rtcPetState.lastNeedDrainEpoch;
+  frame.birthEpoch = petBirthEpoch;
+  frame.sleepStartEpoch = sleepStartEpoch;
+  frame.sleepDurationSec = sleepDurationSec;
+  frame.wakeCause = (int32_t)lastWakeCause;
+  frame.resetReason = (int32_t)esp_reset_reason();
+  frame.appMode = (int32_t)appMode;
+  frame.petMode = (int32_t)petMode;
+  frame.activeAction = (int32_t)activeAction;
+  frame.introSeen = hasSeenDeliveryIntro;
+  frame.pendingRunaway = pendingRunaway;
+  frame.usbActive = serialPortalDisplayActive;
+  frame.needs = captureNeedState();
+  return frame;
+}
 
-  if (zeroNeeds == 0) {
-    happinessValue = weighted;
-    happinessCrisisCarry = 0;
-    rtcPetState.happinessCrisisCarry = happinessCrisisCarry;
-    return;
+void tracePetEvent(const char* event, const char* detail) {
+  PetTrace::record(event, capturePetTraceFrame(), nullptr, detail);
+}
+
+bool shouldShowRunaway() {
+  if (!hasSeenDeliveryIntro || !hasRunawayCriticalNeed() || happinessValue > 0) {
+    pendingRunaway = false;
+    runawayDiagnosticReason = "critical_need_recovered";
+    return false;
   }
 
-  if (happinessValue > weighted) {
-    happinessValue = weighted;
-  }
+  return true;
+}
 
-  if (elapsedSeconds > 0) {
-    uint32_t crisisDrainSeconds = HAPPINESS_CRISIS_SECONDS_PER_POINT_PER_NEED / zeroNeeds;
-    if (crisisDrainSeconds == 0) {
-      crisisDrainSeconds = 1;
-    }
-    uint32_t crisisTicks = computeNeedTicks(elapsedSeconds, crisisDrainSeconds, happinessCrisisCarry);
-    happinessValue = happinessValue > crisisTicks ? happinessValue - (uint8_t)crisisTicks : 0;
-    rtcPetState.happinessCrisisCarry = happinessCrisisCarry;
-  }
-
+void updateHappiness() {
+  PetNeeds::State state = captureNeedState();
+  PetNeeds::refreshHappiness(state);
+  applyNeedState(state);
+  rtcPetState.happinessCrisisCarry = happinessCrisisCarry;
+  rtcPetState.happinessCrisisPenalty = happinessCrisisPenalty;
   maybeTriggerRunaway();
 }
 
 void maybeTriggerRunaway() {
-  if (happinessValue > 0) {
+  if (!hasSeenDeliveryIntro || !hasRunawayCriticalNeed()) {
+    pendingRunaway = false;
+    runawayDiagnosticReason = "critical_need_recovered";
     return;
   }
 
+  if (happinessValue > 0) {
+    pendingRunaway = false;
+    return;
+  }
+
+  runawayDiagnosticReason = "happiness_zero_food_or_pee";
+  if (!pendingRunaway && petMode != PET_RAN_AWAY) tracePetEvent("runaway_decision", runawayDiagnosticReason);
+
   if (serialPortalDisplayActive) {
     pendingRunaway = true;
+    runawayDiagnosticReason = "happiness_zero_food_or_pee_deferred_serial_portal";
     return;
   }
 
   if (appMode != APP_TAMAGOTCHI) {
     pendingRunaway = true;
+    runawayDiagnosticReason = "happiness_zero_food_or_pee_deferred_other_mode";
     return;
   }
 
   if (petMode == PET_ACTION) {
     pendingRunaway = true;
+    runawayDiagnosticReason = "happiness_zero_food_or_pee_deferred_activity";
     return;
   }
 
@@ -1883,29 +2107,6 @@ void maybeTriggerRunaway() {
   }
 
   showRunawayScreen();
-}
-
-void applyNeedDrainTicks(uint32_t peeTicks, uint32_t foodTicks, uint32_t playTicks, uint32_t loveTicks) {
-  if (peeTicks == 0 && foodTicks == 0 && playTicks == 0 && loveTicks == 0) {
-    return;
-  }
-
-  uint8_t previousPee = peeValue;
-  uint8_t previousFood = foodValue;
-  uint8_t previousPlay = playValue;
-  uint8_t previousPets = loveValue;
-
-  peeValue = peeValue > peeTicks ? peeValue - peeTicks : 0;
-  foodValue = foodValue > foodTicks ? foodValue - foodTicks : 0;
-  playValue = playValue > playTicks ? playValue - playTicks : 0;
-  loveValue = loveValue > loveTicks ? loveValue - loveTicks : 0;
-
-  refreshSadNeedAfterNeedChange(
-    firstNeedCrossedByDrain(
-      previousPee, previousFood, previousPlay, previousPets,
-      peeTicks, foodTicks, playTicks, loveTicks
-    )
-  );
 }
 
 void initNeedDrainClockIfNeeded() {
@@ -1940,30 +2141,23 @@ void resetNeedDrainClock() {
 
 void drainNeedsOverTime() {
   initNeedDrainClockIfNeeded();
-
-  // While a user-initiated sleep is in progress, needs are paused everywhere.
-  if (sleepDurationSec > 0) {
-    lastNeedDrainEpoch = (uint32_t)time(NULL);
-    rtcPetState.lastNeedDrainEpoch = lastNeedDrainEpoch;
-    return;
-  }
-
   uint32_t nowEpoch = (uint32_t)time(NULL);
+  PetTrace::Frame traceBefore = capturePetTraceFrame();
+  traceBefore.epoch = nowEpoch;
   if (nowEpoch <= lastNeedDrainEpoch) {
+    PetTrace::drain(traceBefore, traceBefore);
     return;
   }
 
-  uint32_t elapsedSeconds = nowEpoch - lastNeedDrainEpoch;
-  uint32_t peeTicks = (peeCooldownUntilEpoch && nowEpoch < peeCooldownUntilEpoch)
-                        ? 0 : computeNeedTicks(elapsedSeconds, PEE_FULL_DRAIN_SECONDS, peeDrainCarry);
-  uint32_t foodTicks = (foodCooldownUntilEpoch && nowEpoch < foodCooldownUntilEpoch)
-                         ? 0 : computeNeedTicks(elapsedSeconds, FOOD_FULL_DRAIN_SECONDS, foodDrainCarry);
-  uint32_t playTicks = (playCooldownUntilEpoch && nowEpoch < playCooldownUntilEpoch)
-                         ? 0 : computeNeedTicks(elapsedSeconds, PLAY_FULL_DRAIN_SECONDS, playDrainCarry);
-  uint32_t loveTicks = computeNeedTicks(elapsedSeconds, PET_FULL_DRAIN_SECONDS, loveDrainCarry);
-
-  applyNeedDrainTicks(peeTicks, foodTicks, playTicks, loveTicks);
-  updateHappiness(elapsedSeconds);
+  PetNeeds::State state = captureNeedState();
+  uint32_t pausedUntil = sleepDurationSec > 0 ? sleepStartEpoch + sleepDurationSec : 0;
+  PetNeeds::Need firstLow = PetNeeds::advance(state, lastNeedDrainEpoch, nowEpoch, pausedUntil);
+  applyNeedState(state);
+  PetTrace::Frame traceAfter = capturePetTraceFrame();
+  PetTrace::drain(traceBefore, traceAfter);
+  const SadNeed sadNeeds[PetNeeds::Count] = {SAD_NEED_PEE, SAD_NEED_FOOD, SAD_NEED_PLAY, SAD_NEED_PETS};
+  refreshSadNeedAfterNeedChange(firstLow == PetNeeds::None ? SAD_NEED_NONE : sadNeeds[firstLow]);
+  maybeTriggerRunaway();
 
   // Carries have already absorbed elapsedSeconds, so always advance the clock
   // (otherwise the next call would double-count this interval).
@@ -1973,6 +2167,9 @@ void drainNeedsOverTime() {
   rtcPetState.foodDrainCarry = foodDrainCarry;
   rtcPetState.playDrainCarry = playDrainCarry;
   rtcPetState.loveDrainCarry = loveDrainCarry;
+  rtcPetState.happinessCrisisCarry = happinessCrisisCarry;
+  rtcPetState.happinessCrisisPenalty = happinessCrisisPenalty;
+  rtcPetState.care = careState;
 }
 
 // ---------------- PET STATE / SLEEP ----------------
@@ -2095,6 +2292,8 @@ void showDeepSleepSplashScreen() {
 }
 
 void initDefaultPetState() {
+  careState = {};
+  careNoticeAwaitRelease = false;
   peeValue = 80;
   foodValue = 80;
   playValue = 80;
@@ -2110,8 +2309,11 @@ void initDefaultPetState() {
   playDrainCarry = 0;
   loveDrainCarry = 0;
   happinessCrisisCarry = 0;
+  happinessCrisisPenalty = 0;
   hasSeenDeliveryIntro = false;
   pendingRunaway = false;
+  runawayDiagnosticReason = "init_default_pet_state";
+  rtcRunawayDeathLogged = 0;
   sleepStartEpoch = 0;
   sleepDurationSec = 0;
   sleepCooldownUntilEpoch = 0;
@@ -2131,7 +2333,7 @@ void savePetStateToRtc() {
   rtcPetState.playValue = playValue;
   rtcPetState.loveValue = loveValue;
   rtcPetState.activeSadNeed = (uint8_t)activeSadNeed;
-  rtcPetState.selectedAction = selectedAction;
+  rtcPetState.selectedAction = (uint8_t)selectedAction;
   rtcPetState.appMode = (uint8_t)appMode;
   rtcPetState.homeSelection = (uint8_t)homeSelection;
   rtcPetState.petAgeStarted = petAgeStarted ? 1 : 0;
@@ -2147,6 +2349,7 @@ void savePetStateToRtc() {
   rtcPetState.loveDrainCarry = loveDrainCarry;
   rtcPetState.happinessValue = happinessValue;
   rtcPetState.happinessCrisisCarry = happinessCrisisCarry;
+  rtcPetState.happinessCrisisPenalty = happinessCrisisPenalty;
   rtcPetState.hasSeenDeliveryIntro = hasSeenDeliveryIntro ? 1 : 0;
   rtcPetState.sleeping = (sleepDurationSec > 0) ? 1 : 0;
   rtcPetState.sleepStartEpoch = sleepStartEpoch;
@@ -2155,6 +2358,7 @@ void savePetStateToRtc() {
   rtcPetState.peeCooldownUntilEpoch = peeCooldownUntilEpoch;
   rtcPetState.foodCooldownUntilEpoch = foodCooldownUntilEpoch;
   rtcPetState.playCooldownUntilEpoch = playCooldownUntilEpoch;
+  rtcPetState.care = careState;
 }
 
 bool restorePetStateFromRtc() {
@@ -2179,6 +2383,7 @@ bool restorePetStateFromRtc() {
   loveDrainCarry = rtcPetState.loveDrainCarry;
   happinessValue = rtcPetState.happinessValue;
   happinessCrisisCarry = rtcPetState.happinessCrisisCarry;
+  happinessCrisisPenalty = rtcPetState.happinessCrisisPenalty;
   hasSeenDeliveryIntro = rtcPetState.hasSeenDeliveryIntro != 0;
   sleepStartEpoch = rtcPetState.sleepStartEpoch;
   sleepDurationSec = rtcPetState.sleepDurationSec;
@@ -2186,6 +2391,7 @@ bool restorePetStateFromRtc() {
   peeCooldownUntilEpoch = rtcPetState.peeCooldownUntilEpoch;
   foodCooldownUntilEpoch = rtcPetState.foodCooldownUntilEpoch;
   playCooldownUntilEpoch = rtcPetState.playCooldownUntilEpoch;
+  careState = rtcPetState.care;
 
   if (appMode > APP_EREADER) {
     appMode = APP_TAMAGOTCHI;
@@ -2204,9 +2410,43 @@ bool restorePetStateFromRtc() {
   }
 
   refreshSadNeedAfterNeedChange(SAD_NEED_NONE);
-  updateHappiness(0);
 
   return true;
+}
+
+void savePetStateCheckpoint() {
+  savePetStateToRtc();
+  petCheckpointDirty = !PetStateStore::save(rtcPetState);
+  lastPetCheckpointMs = millis();
+  if (petCheckpointDirty) {
+    Serial.println("Pet checkpoint could not be saved");
+  }
+}
+
+void servicePetStateCheckpoint() {
+  unsigned long elapsed = millis() - lastPetCheckpointMs;
+  if ((petCheckpointDirty && elapsed >= PET_CHECKPOINT_RETRY_MS) ||
+      elapsed >= PET_CHECKPOINT_INTERVAL_MS) {
+    savePetStateCheckpoint();
+  }
+}
+
+PetStateRestoreSource restorePetStateForBoot(esp_sleep_wakeup_cause_t wakeCause) {
+  if (wakeCause == ESP_SLEEP_WAKEUP_EXT1 && restorePetStateFromRtc()) {
+    return PET_STATE_RTC;
+  }
+
+  PetStateStore::Snapshot checkpoint = {};
+  if (PetStateStore::load(checkpoint)) {
+    rtcPetState = checkpoint;
+    if (restorePetStateFromRtc()) {
+      Serial.println("Restored pet after restart");
+      return PET_STATE_CHECKPOINT;
+    }
+  }
+
+  initDefaultPetState();
+  return PET_STATE_FRESH;
 }
 
 void applyNeedsSinceSleep() {
@@ -2242,6 +2482,7 @@ void enterDeepSleep() {
   Serial.println("Entering deep sleep");
 
   savePetStateToRtc();
+  tracePetEvent("deep_sleep_enter");
 
   if (appMode == APP_EREADER) {
     ereaderLeave();
@@ -2262,6 +2503,7 @@ void enterDeepSleep() {
 
 void enterHomeScreen() {
   Serial.println("Entering home screen");
+  tracePetEvent("home_enter_before");
 
   if (appMode == APP_EREADER) {
     ereaderLeave();
@@ -2277,30 +2519,39 @@ void enterHomeScreen() {
   inputLockoutUntil = 0;
   discardWakeInput = false;
   lastActivityMs = millis();
+  savePetStateCheckpoint();
   showHomeScreenFull();
+  tracePetEvent("home_enter_after");
 }
 
 void enterTamagotchi() {
   Serial.println("Entering tamagotchi");
+  tracePetEvent("tamagotchi_enter_before");
 
+  drainNeedsOverTime();
   attachMainInputInterrupts();
   resetMainInputState();
   appMode = APP_TAMAGOTCHI;
+  savePetStateCheckpoint();
   forceFullRefreshNextFrame = true;
   discardWakeInput = false;
   enterTamagotchiInitialScreen();
   lastActivityMs = millis();
+  tracePetEvent("tamagotchi_enter_after");
 }
 
 void enterEreaderMode() {
+  tracePetEvent("reader_enter_before");
   Serial.println("Entering ereader");
 
   detachMainInputInterrupts();
   resetMainInputState();
   appMode = APP_EREADER;
+  savePetStateCheckpoint();
   discardWakeInput = false;
   lastActivityMs = millis();
   ereaderRequestEnter();
+  tracePetEvent("reader_enter_after");
 }
 
 void startIdle() {
@@ -2321,13 +2572,18 @@ void startIdle() {
 }
 
 void startSleep(uint32_t durationSec) {
+  tracePetEvent("scheduled_sleep_before");
   // Count need drain up to this moment, then pause for the sleep period.
   drainNeedsOverTime();
+  if (petMode == PET_RAN_AWAY) {
+    return;
+  }
 
   sleepStartEpoch = (uint32_t)time(NULL);
   sleepDurationSec = durationSec;
   sleepCooldownUntilEpoch = 0;
   sleepWakeButtonShown = true;
+  sleepOkIgnoredUntilMs = millis() + SLEEP_START_OK_LOCKOUT_MS;
 
   petMode = PET_SLEEPING;
   activeAction = ACTIVE_NONE;
@@ -2344,7 +2600,7 @@ void startSleep(uint32_t durationSec) {
   lastFrameMs = millis();
   lastActivityMs = millis();
 
-  savePetStateToRtc();
+  savePetStateCheckpoint();
 
   Serial.printf("Sleep started: %lu seconds\n", (unsigned long)durationSec);
 
@@ -2355,6 +2611,9 @@ void startSleep(uint32_t durationSec) {
 }
 
 void wakeCatFromSleep(bool early) {
+  tracePetEvent("scheduled_wake_before", early ? "early" : "completed");
+  // Catch up through the scheduled end before clearing the sleep interval.
+  drainNeedsOverTime();
   if (early) {
     sleepCooldownUntilEpoch = 0;
   } else {
@@ -2366,10 +2625,7 @@ void wakeCatFromSleep(bool early) {
   sleepStartEpoch = 0;
   sleepDurationSec = 0;
   sleepWakeButtonShown = false;
-
-  // Discard the paused interval so needs do not drain for the time spent asleep.
-  lastNeedDrainEpoch = (uint32_t)time(NULL);
-  rtcPetState.lastNeedDrainEpoch = lastNeedDrainEpoch;
+  sleepOkIgnoredUntilMs = 0;
 
   if (selectedAction == ACTION_SLEEP && isSleepOnCooldown()) {
     selectedAction = ACTION_PET;
@@ -2379,10 +2635,17 @@ void wakeCatFromSleep(bool early) {
   inputLockoutUntil = millis() + 150;
   forceFullRefreshNextFrame = true;
 
-  savePetStateToRtc();
+  savePetStateCheckpoint();
 
   Serial.println(early ? "Woke early (no cooldown)" : "Woke naturally (cooldown set)");
 
+  if (petMode == PET_RAN_AWAY) {
+    return;
+  }
+  if (shouldShowRunaway()) {
+    showRunawayScreen();
+    return;
+  }
   startIdle();
 }
 
@@ -2506,31 +2769,33 @@ void finishActionAndReturnToIdle() {
 
   drainNeedsOverTime();
 
-  uint32_t nowEpoch = (uint32_t)time(NULL);
+  // Use the same sampled epoch as the drain, so refills never precede their clock.
+  uint32_t nowEpoch = lastNeedDrainEpoch;
+  tracePetEvent("activity_refill_before");
+  PetNeeds::State state = captureNeedState();
 
   if (activeAction == ACTIVE_PEE) {
-    peeValue = 100;
-    peeCooldownUntilEpoch = nowEpoch + PEE_CD_SEC;
+    PetNeeds::refill(state, PetNeeds::Pee, nowEpoch + PEE_CD_SEC, nowEpoch);
   }
 
   if (activeAction == ACTIVE_FOOD) {
-    foodValue = 100;
-    foodCooldownUntilEpoch = nowEpoch + FOOD_CD_SEC;
+    PetNeeds::refill(state, PetNeeds::Food, nowEpoch + FOOD_CD_SEC, nowEpoch);
   }
 
   if (activeAction == ACTIVE_PLAY) {
-    playValue = 100;
-    playCooldownUntilEpoch = nowEpoch + PLAY_CD_SEC;
+    PetNeeds::refill(state, PetNeeds::Play, nowEpoch + PLAY_CD_SEC, nowEpoch);
   }
 
   if (activeAction == ACTIVE_PET) {
-    loveValue = 100;
+    PetNeeds::refill(state, PetNeeds::Pets, 0, nowEpoch);
   }
 
-  updateHappiness(0);
+  applyNeedState(state);
+  updateHappiness();
+  savePetStateCheckpoint();
+  tracePetEvent("activity_refill_after");
 
-  if (pendingRunaway || happinessValue == 0) {
-    pendingRunaway = false;
+  if (shouldShowRunaway()) {
     showRunawayScreen();
     clearInputQueue();
     inputLockoutUntil = millis() + 100;
@@ -2667,6 +2932,11 @@ void onMainToggleTap() {
     return;
   }
 
+  if (appMode == APP_TAMAGOTCHI && petMode == PET_CARE_NOTICE) {
+    acknowledgeCareNotice();
+    return;
+  }
+
   if (appMode == APP_TAMAGOTCHI && petMode == PET_SLEEP_SELECT) {
     startSleep(sleepDialogChoice == 0 ? SLEEP_SHORT_SEC : SLEEP_LONG_SEC);
     return;
@@ -2780,6 +3050,11 @@ void processInputEvent(InputEvent event) {
 
   lastActivityMs = millis();
 
+  if (appMode == APP_TAMAGOTCHI && petMode == PET_SLEEPING &&
+      event == INPUT_MAIN && millis() < sleepOkIgnoredUntilMs) {
+    return;
+  }
+
   if (event == INPUT_MAIN) {
     onMainToggleTap();
     return;
@@ -2803,7 +3078,7 @@ void processInputEvent(InputEvent event) {
     return;
   }
 
-  if (petMode == PET_RAN_AWAY || petMode == PET_INTRO) {
+  if (petMode == PET_RAN_AWAY || petMode == PET_INTRO || petMode == PET_CARE_NOTICE) {
     return;
   }
 
@@ -2857,6 +3132,8 @@ void setup() {
   delay(500);
 
   esp_sleep_wakeup_cause_t wakeCause = esp_sleep_get_wakeup_cause();
+  lastWakeCause = wakeCause;
+  PetTrace::begin(esp_random());
 
   pinMode(EPD_POWER, OUTPUT);
   digitalWrite(EPD_POWER, HIGH);
@@ -2875,35 +3152,34 @@ void setup() {
 
   Serial.println("AdventureCattoEink");
   Serial.println("Interrupt input enabled");
-  Serial.println("Main toggle tap: select action / enter mode");
-  Serial.println("Menu button tap: exit to home screen");
+  Serial.println("Top button tap: select action / enter mode");
+  Serial.println("Toggle press: exit to home screen");
   Serial.println("Up/down: select pee, food, play, or home menu");
   Serial.println("Inputs are queued immediately on button press");
   Serial.println("Input capture locks during actions to prevent duplicate actions");
 
   lastActivityMs = millis();
 
-  bool restoredFromRtc = false;
+  PetStateRestoreSource restoreSource = restorePetStateForBoot(wakeCause);
+  bool restoredPet = restoreSource != PET_STATE_FRESH;
+  tracePetEvent("boot_restored", restoreSource == PET_STATE_RTC ? "rtc" :
+                restoreSource == PET_STATE_CHECKPOINT ? "checkpoint" : "fresh");
   if (wakeCause == ESP_SLEEP_WAKEUP_EXT1) {
     Serial.println("Woke from deep sleep");
+  }
+  if (restoredPet) {
     discardWakeInput = true;
     forceFullRefreshNextFrame = true;
     clearInputQueue();
-
-    if (restorePetStateFromRtc()) {
-      restoredFromRtc = true;
-    } else {
-      initDefaultPetState();
-    }
-  } else {
-    initDefaultPetState();
   }
 
-  initDeviceTime(restoredFromRtc);
+  initDeviceTime(restoredPet);
+  tracePetEvent("boot_clock_initialized", "expected_clock_rebase_if_not_retained");
 
-  if (wakeCause == ESP_SLEEP_WAKEUP_EXT1 && restoredFromRtc) {
+  if (restoredPet) {
     applyNeedsSinceSleep();
   }
+  savePetStateCheckpoint();
 
   if (appMode == APP_HOME) {
     showHomeScreenFull();
@@ -2923,6 +3199,8 @@ void setup() {
 
 void loop() {
   unsigned long now = millis();
+  // Save completed updates only; runaway can be drawn inside a drain update.
+  servicePetStateCheckpoint();
   bool serialPortalSawInput = serialLibraryPortalLoop();
   bool serialPortalTransitioned = handleSerialPortalDisplayState();
   bool serialPortalKeepAwake = serialPortalSawInput || serialLibraryPortalIsBusy();
@@ -3020,6 +3298,12 @@ void loop() {
     return;
   }
 
+  if (petMode == PET_CARE_NOTICE) {
+    loopCareNotice();
+    delay(5);
+    return;
+  }
+
   updateMenuButtonInput();
   if (appMode != APP_TAMAGOTCHI) {
     delay(5);
@@ -3027,8 +3311,9 @@ void loop() {
   }
 
   if (petMode == PET_INTRO) {
-    if (now - introStartedMs >= INTRO_PLACEHOLDER_MS) {
-      completeDeliveryIntro();
+    if (now - lastFrameMs >= getDeliveryIntroCurrentFrameHoldMs()) {
+      lastFrameMs = now;
+      advanceDeliveryIntroAnimation();
     }
 
     delay(5);
@@ -3232,6 +3517,10 @@ void loop() {
 
     if (petMode == PET_IDLE) {
       drainNeedsOverTime();
+      if (petMode != PET_IDLE) {
+        delay(5);
+        return;
+      }
       bool animationChanged = syncIdleAnimationToNeeds();
 
       if (!animationChanged && now - lastFrameMs >= currentAnimation->frameHoldMs) {
@@ -3262,6 +3551,10 @@ void loop() {
   // Idle state: idle loops and needs drain.
   if (petMode == PET_IDLE) {
     drainNeedsOverTime();
+    if (petMode != PET_IDLE) {
+      delay(5);
+      return;
+    }
     bool animationChanged = syncIdleAnimationToNeeds();
 
     unsigned long inactiveMs = now - lastActivityMs;

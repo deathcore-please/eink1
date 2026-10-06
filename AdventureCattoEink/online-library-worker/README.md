@@ -79,5 +79,6 @@ location.reload();
 - `POST /api/devices/:deviceId/books`
 - `GET /api/devices/:deviceId/books/:fileId/content`
 - `DELETE /api/devices/:deviceId/books/:fileId`
+- `DELETE /api/devices/:deviceId/uploads/:uploadId`
 
 There is intentionally no user login or API auth. Anyone with the Worker URL and a valid `deviceId` can edit that device's online library.

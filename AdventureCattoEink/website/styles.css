@@ -290,6 +290,24 @@ h1 {
   font-size: 14px;
 }
 
+.diagnostics-actions {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  justify-content: flex-end;
+  margin-top: -8px;
+}
+
+.care-trace-actions {
+  margin-top: 16px;
+  flex-wrap: wrap;
+}
+
+.danger-button {
+  border-color: var(--danger);
+  color: var(--danger);
+}
+
 .library-table {
   width: 100%;
   border-collapse: collapse;
@@ -460,7 +478,7 @@ h1 {
 
 .upload-progress {
   display: grid;
-  grid-template-columns: minmax(0, 1fr) auto;
+  grid-template-columns: minmax(0, 1fr) auto auto;
   gap: 16px;
   align-items: center;
   margin-top: 16px;
@@ -482,6 +500,31 @@ h1 {
   font-size: 14px;
   min-width: 72px;
   text-align: right;
+}
+
+.upload-progress small {
+  grid-column: 1 / -1;
+  color: #aaa;
+  font-size: 11px;
+  letter-spacing: 2px;
+  line-height: 1.4;
+  text-align: right;
+  text-transform: uppercase;
+}
+
+.cancel-upload-button {
+  border: 0;
+  background: transparent;
+  color: var(--danger);
+  font-size: 12px;
+  letter-spacing: 3px;
+  padding: 0;
+  text-transform: uppercase;
+}
+
+.cancel-upload-button:disabled {
+  cursor: not-allowed;
+  opacity: 0.42;
 }
 
 .credit {
@@ -607,6 +650,16 @@ h1 {
     flex-direction: column;
     margin-top: -4px;
     text-align: center;
+  }
+
+  .diagnostics-actions {
+    align-items: stretch;
+    flex-direction: column;
+    margin-top: -4px;
+  }
+
+  .care-trace-actions {
+    margin-top: 20px;
   }
 
   .library-table {

@@ -1,5 +1,6 @@
 node_modules/
 .pnpm-store/
+.wrangler/
 online-library-worker/node_modules/
 online-library-worker/.wrangler/
 online-library-worker/.wrangler-state/

@@ -306,6 +306,40 @@ void EPD_ShowString(uint16_t x, uint16_t y, const char *s, uint8_t color, uint16
     }
 }
 
+void EPD_ShowStringBold16(uint16_t x, uint16_t y, const char* text, uint8_t color)
+{
+    if (text == nullptr || x >= EPD_W || y >= EPD_H)
+        return;
+
+    for (uint32_t penX = x; *text != '\0' && penX < EPD_W; ++text, penX += 8)
+    {
+        const uint8_t character = static_cast<uint8_t>(*text);
+        if (character < ' ' || character > '~')
+            return;
+
+        const uint8_t* glyph = ascii_1608[character - ' '];
+        for (uint8_t row = 0; row < 16; ++row)
+        {
+            const uint32_t pixelY = static_cast<uint32_t>(y) + row;
+            if (pixelY >= EPD_H)
+                break;
+
+            for (uint8_t column = 0; column < 8; ++column)
+            {
+                const uint32_t pixelX = penX + column;
+                if (pixelX >= EPD_W)
+                    break;
+                if ((glyph[row] & (0x01u << column)) == 0)
+                    continue;
+
+                EPD_DrawPoint(static_cast<uint16_t>(pixelX), static_cast<uint16_t>(pixelY), color);
+                if (pixelX + 1 < EPD_W)
+                    EPD_DrawPoint(static_cast<uint16_t>(pixelX + 1), static_cast<uint16_t>(pixelY), color);
+            }
+        }
+    }
+}
+
 /**
  * @brief       幂运算(内部调用)
  * @param       m:底数

@@ -25,7 +25,9 @@ export default {
 
 async function handleRequest(request, env) {
   const url = new URL(request.url);
-  const match = url.pathname.match(/^\/api\/devices\/([^/]+)\/books(?:\/([^/]+)(?:\/content)?)?(?:\/resolve-name)?$/);
+  const booksMatch = url.pathname.match(/^\/api\/devices\/([^/]+)\/books(?:\/([^/]+)(?:\/content)?)?(?:\/resolve-name)?$/);
+  const uploadsMatch = url.pathname.match(/^\/api\/devices\/([^/]+)\/uploads\/([^/]+)$/);
+  const match = booksMatch || uploadsMatch;
 
   if (!match) {
     return jsonResponse({ ok: false, message: "Not found" }, 404);
@@ -39,6 +41,15 @@ async function handleRequest(request, env) {
   const token = await getAccessToken(env);
   const deviceFolderId = await ensureDeviceFolder(env, token, deviceId);
   const path = url.pathname;
+
+  if (uploadsMatch) {
+    if (request.method !== "DELETE") {
+      return jsonResponse({ ok: false, message: "Unsupported method" }, 405);
+    }
+
+    const uploadId = validateUploadId(decodeURIComponent(uploadsMatch[2]));
+    return cleanupUpload(env, token, deviceId, deviceFolderId, uploadId);
+  }
 
   if (request.method === "GET" && path.endsWith("/books")) {
     return jsonResponse(await listLibrary(env, token, deviceId, deviceFolderId));
@@ -97,19 +108,28 @@ function validateTxtName(name) {
   return value;
 }
 
+function validateUploadId(uploadId) {
+  const value = String(uploadId || "").trim();
+  if (!/^upl-[0-9a-fA-F-]{36}$/.test(value)) {
+    throw new Error("Invalid upload id.");
+  }
+  return value;
+}
+
 function uniqueBookName(name, books) {
+  const original = validateTxtName(name);
   const existing = new Set(books.map((book) => book.name.toLowerCase()));
-  if (!existing.has(name.toLowerCase())) {
-    return name;
+  if (!existing.has(original.toLowerCase())) {
+    return original;
   }
 
-  const dot = name.toLowerCase().lastIndexOf(".txt");
-  const base = name.slice(0, dot);
-  const extension = name.slice(dot);
+  const extension = ".txt";
+  const base = original.slice(0, -extension.length);
   let index = 1;
 
   while (true) {
-    const candidate = `${base} (${index})${extension}`;
+    const suffix = ` (${index})${extension}`;
+    const candidate = validateTxtName(`${base.slice(0, 96 - suffix.length)}${suffix}`);
     if (!existing.has(candidate.toLowerCase())) {
       return candidate;
     }
@@ -159,6 +179,7 @@ async function uploadBook(request, env, token, deviceId, deviceFolderId) {
   const form = await request.formData();
   const file = form.get("file");
   const requestedName = validateTxtName(form.get("name") || file?.name);
+  const uploadId = validateUploadId(form.get("uploadId") || `upl-${crypto.randomUUID()}`);
 
   if (!file || typeof file.arrayBuffer !== "function") {
     throw new Error("Missing upload file.");
@@ -179,12 +200,13 @@ async function uploadBook(request, env, token, deviceId, deviceFolderId) {
   }
 
   const finalName = uniqueBookName(requestedName, current.books);
-  const uploaded = await uploadTextFile(env, token, deviceFolderId, finalName, bytes);
+  const uploaded = await uploadTextFile(env, token, deviceFolderId, finalName, bytes, uploadId);
   const next = await listLibrary(env, token, deviceId, deviceFolderId);
 
   return jsonResponse({
     ok: true,
     deviceId,
+    uploadId,
     book: {
       id: uploaded.id,
       name: uploaded.name || finalName,
@@ -198,12 +220,15 @@ async function uploadBook(request, env, token, deviceId, deviceFolderId) {
   });
 }
 
-async function uploadTextFile(env, token, folderId, name, bytes) {
+async function uploadTextFile(env, token, folderId, name, bytes, uploadId) {
   const boundary = `acat-${crypto.randomUUID()}`;
   const metadata = {
     name,
     parents: [folderId],
     mimeType: "text/plain",
+    appProperties: {
+      adventureCattoUploadId: uploadId,
+    },
   };
 
   const body = new Blob([
@@ -216,7 +241,7 @@ async function uploadTextFile(env, token, folderId, name, bytes) {
     `\r\n--${boundary}--\r\n`,
   ], { type: `multipart/related; boundary=${boundary}` });
 
-  const response = await fetch(`${DRIVE_UPLOAD_API}/files?uploadType=multipart&fields=id,name,size,mimeType,createdTime,modifiedTime`, {
+  const response = await fetch(`${DRIVE_UPLOAD_API}/files?uploadType=multipart&fields=id,name,size,mimeType,createdTime,modifiedTime,appProperties`, {
     method: "POST",
     headers: {
       Authorization: `Bearer ${token}`,
@@ -242,6 +267,34 @@ async function downloadBook(env, token, deviceFolderId, fileId) {
     "Access-Control-Expose-Headers": "Content-Disposition",
   });
   return new Response(response.body, { status: 200, headers });
+}
+
+async function cleanupUpload(env, token, deviceId, deviceFolderId, uploadId) {
+  const files = await listFilesByUploadId(env, token, deviceFolderId, uploadId);
+  for (const file of files) {
+    await driveFetch(env, token, `/files/${encodeURIComponent(file.id)}`, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ trashed: true }),
+    });
+  }
+  return jsonResponse(await listLibrary(env, token, deviceId, deviceFolderId));
+}
+
+async function listFilesByUploadId(env, token, folderId, uploadId) {
+  const q = [
+    `'${escapeDriveQuery(folderId)}' in parents`,
+    "trashed = false",
+    `appProperties has { key='adventureCattoUploadId' and value='${escapeDriveQuery(uploadId)}' }`,
+  ].join(" and ");
+  const params = new URLSearchParams({
+    q,
+    fields: "files(id,name)",
+    pageSize: "100",
+  });
+  const response = await driveFetch(env, token, `/files?${params.toString()}`);
+  const data = await response.json();
+  return data.files || [];
 }
 
 async function ensureDeviceFolder(env, token, deviceId) {

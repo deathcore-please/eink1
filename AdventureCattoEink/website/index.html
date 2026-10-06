@@ -93,6 +93,25 @@
         </table>
       </section>
 
+      <section id="diagnosticsSection" class="section diagnostics-section" hidden>
+        <div class="library-title-row">
+          <div class="section-title no-icon">
+            <span>Diagnostics</span>
+          </div>
+          <span id="deathLogInfo" class="title-count">0 Records</span>
+        </div>
+
+        <div class="diagnostics-actions">
+          <button id="downloadDeathLogButton" class="secondary-button" type="button">Download Death Log</button>
+          <button id="clearDeathLogButton" class="secondary-button danger-button" type="button">Clear Death Log</button>
+        </div>
+        <div class="diagnostics-actions care-trace-actions">
+          <button id="downloadCareTraceButton" class="secondary-button" type="button">Download Care Trace</button>
+          <button id="clearCareTraceButton" class="secondary-button danger-button" type="button">Clear Care Trace</button>
+          <span id="careTraceInfo" class="title-count">Unavailable</span>
+        </div>
+      </section>
+
       <section id="onlineLibrarySection" class="section library-section">
         <div class="library-title-row">
           <div class="section-title no-icon">
@@ -146,6 +165,8 @@
             <div id="uploadFill"></div>
           </div>
           <span id="uploadText">Waiting</span>
+          <button id="cancelUploadButton" class="cancel-upload-button" type="button">Cancel</button>
+          <small>Do not unplug device while the book uploads</small>
         </div>
       </section>
     </main>

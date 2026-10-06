@@ -27,12 +27,15 @@ let busy = false;
 let connecting = false;
 let knownPorts = [];
 let heartbeatTimer = 0;
+let activeUploadJob = null;
 
 const pendingResponses = [];
 const state = {
   deviceId: "",
   storage: null,
   books: [],
+  deathLog: null,
+  careTrace: null,
   onlineStorage: null,
   onlineBooks: [],
   onlineAvailable: false,
@@ -52,6 +55,13 @@ const els = {
   storageDetail: document.getElementById("storageDetail"),
   bookRows: document.getElementById("bookRows"),
   bookCount: document.getElementById("bookCount"),
+  diagnosticsSection: document.getElementById("diagnosticsSection"),
+  deathLogInfo: document.getElementById("deathLogInfo"),
+  downloadDeathLogButton: document.getElementById("downloadDeathLogButton"),
+  clearDeathLogButton: document.getElementById("clearDeathLogButton"),
+  careTraceInfo: document.getElementById("careTraceInfo"),
+  downloadCareTraceButton: document.getElementById("downloadCareTraceButton"),
+  clearCareTraceButton: document.getElementById("clearCareTraceButton"),
   onlineLibrarySection: document.getElementById("onlineLibrarySection"),
   onlineBookRows: document.getElementById("onlineBookRows"),
   onlineBookCount: document.getElementById("onlineBookCount"),
@@ -63,6 +73,7 @@ const els = {
   uploadProgress: document.getElementById("uploadProgress"),
   uploadFill: document.getElementById("uploadFill"),
   uploadText: document.getElementById("uploadText"),
+  cancelUploadButton: document.getElementById("cancelUploadButton"),
 };
 
 if (!("serial" in navigator)) {
@@ -116,6 +127,20 @@ els.onlineFileInput.addEventListener("change", () => {
     uploadFileToOnlineLibrary(file);
   }
 });
+
+els.cancelUploadButton.addEventListener("click", () => {
+  requestActiveUploadCancel();
+});
+
+els.downloadDeathLogButton.addEventListener("click", () => {
+  downloadDeathLog();
+});
+
+els.clearDeathLogButton.addEventListener("click", () => {
+  clearDeathLog();
+});
+els.downloadCareTraceButton?.addEventListener("click", () => downloadDiagnosticLog("CARETRACE"));
+els.clearCareTraceButton?.addEventListener("click", () => clearCareTrace());
 
 ["dragenter", "dragover"].forEach((eventName) => {
   els.dropZone.addEventListener(eventName, (event) => {
@@ -195,6 +220,88 @@ function setBusy(nextBusy) {
   document.querySelectorAll(".row-action").forEach((button) => {
     button.disabled = busy || !port;
   });
+  updateDiagnosticsControls();
+  updateCancelUploadButton();
+}
+
+class UploadCancelledError extends Error {
+  constructor() {
+    super("Upload cancelled.");
+    this.name = "UploadCancelledError";
+  }
+}
+
+function isUploadCancelledError(error) {
+  return error?.name === "UploadCancelledError";
+}
+
+function createUploadJob(kind) {
+  if (activeUploadJob) {
+    throw new Error("Another upload is already active.");
+  }
+
+  activeUploadJob = {
+    kind,
+    uploadId: createUploadId(),
+    cancelRequested: false,
+    cleanupStarted: false,
+    deviceName: "",
+    deviceUploadStarted: false,
+    deviceCommitted: false,
+    onlineUploadStarted: false,
+    onlineCommitted: false,
+    onlineFileId: "",
+    progress: 0,
+  };
+  updateCancelUploadButton();
+  return activeUploadJob;
+}
+
+function finishUploadJob(job) {
+  if (activeUploadJob === job) {
+    activeUploadJob = null;
+  }
+  updateCancelUploadButton();
+}
+
+function requestActiveUploadCancel() {
+  if (!activeUploadJob || activeUploadJob.cleanupStarted) {
+    return;
+  }
+
+  activeUploadJob.cancelRequested = true;
+  setStatus("Cancelling upload...");
+  showUploadProgress(activeUploadJob.progress || 0, "Cancelling");
+  updateCancelUploadButton();
+}
+
+function updateCancelUploadButton() {
+  if (!els.cancelUploadButton) {
+    return;
+  }
+
+  const hasActiveJob = Boolean(activeUploadJob);
+  els.cancelUploadButton.disabled = !hasActiveJob || activeUploadJob.cleanupStarted;
+  els.cancelUploadButton.textContent = activeUploadJob?.cancelRequested ? "Cancelling" : "Cancel";
+}
+
+function throwIfUploadCancelled(job) {
+  if (job?.cancelRequested) {
+    throw new UploadCancelledError();
+  }
+}
+
+function createUploadId() {
+  if (crypto.randomUUID) {
+    return `upl-${crypto.randomUUID()}`;
+  }
+
+  const bytes = new Uint8Array(16);
+  crypto.getRandomValues(bytes);
+  bytes[6] = (bytes[6] & 0x0f) | 0x40;
+  bytes[8] = (bytes[8] & 0x3f) | 0x80;
+  const hex = Array.from(bytes, (byte) => byte.toString(16).padStart(2, "0")).join("");
+  return `upl-${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
 }
 
 function setConnected(isConnected, keepBusy = false) {
@@ -202,6 +309,7 @@ function setConnected(isConnected, keepBusy = false) {
   els.connectionState.lastChild.textContent = isConnected ? " Connected" : " Disconnected";
   els.connectButton.textContent = isConnected ? "Disconnect" : "Connect";
   renderPortOptions();
+  renderDiagnostics();
   if (!keepBusy) {
     setBusy(false);
   }
@@ -235,6 +343,8 @@ async function connectDevice(preselectedPort = null) {
     const hello = await sendCommand("ACAT HELLO", ["hello"], HANDSHAKE_TIMEOUT_MS);
     state.deviceId = hello.deviceId || "";
     await refreshLibrary(false);
+    await refreshDeathLogInfo(false);
+    await refreshCareTraceInfo();
     await refreshOnlineLibrary(false);
     setStatus("Connected.", "good");
   } catch (error) {
@@ -284,6 +394,7 @@ async function disconnectDevice(showStatus = true, notifyDevice = true) {
   lineBuffer = "";
   state.deviceId = "";
   resetOnlineLibrary();
+  resetDiagnostics();
   rejectPending("Disconnected.");
   setConnected(false);
 
@@ -478,6 +589,152 @@ async function refreshLibrary(showMessage = true) {
   }
 }
 
+async function refreshDeathLogInfo(showMessage = true) {
+  if (!port) {
+    resetDiagnostics();
+    return;
+  }
+
+  try {
+    if (showMessage) {
+      setBusy(true);
+      setStatus("Reading diagnostics...");
+    }
+
+    const data = await sendCommand("ACAT DIAG DEATHLOG INFO", ["diag-deathlog-info"], 8000);
+    updateDeathLogInfo(data);
+
+    if (showMessage) {
+      setStatus("Diagnostics refreshed.", "good");
+    }
+  } catch (error) {
+    state.deathLog = null;
+    renderDiagnostics();
+    if (showMessage) {
+      setStatus(error.message || "Could not read diagnostics.", "bad");
+    }
+  } finally {
+    if (showMessage) {
+      setBusy(false);
+    }
+  }
+}
+
+async function downloadDeathLog() {
+  return downloadDiagnosticLog("DEATHLOG");
+}
+
+async function refreshCareTraceInfo() {
+  if (!port) return;
+  try {
+    const data = await sendCommand("ACAT DIAG CARETRACE INFO", ["diag-caretrace-info"], 8000);
+    state.careTrace = { bytes: Number(data.bytes || 0), entries: Number(data.entries || 0) };
+  } catch {
+    state.careTrace = null;
+  }
+  renderDiagnostics();
+}
+
+async function clearCareTrace() {
+  if (!port || busy || !window.confirm("Clear the care trace from the device?")) return;
+  try {
+    setBusy(true);
+    await sendCommand("ACAT DIAG CARETRACE CLEAR", ["diag-caretrace-clear"], 8000);
+    await refreshCareTraceInfo();
+    setStatus("Care trace cleared.", "good");
+  } catch (error) {
+    setStatus(error.message || "Could not clear care trace.", "bad");
+  } finally {
+    setBusy(false);
+  }
+}
+
+async function downloadDiagnosticLog(topic) {
+  const careTrace = topic === "CARETRACE";
+  const label = careTrace ? "care trace" : "death log";
+  const responseType = careTrace ? "diag-caretrace-read" : "diag-deathlog-read";
+  if (!port) {
+    setStatus("Connect the device first.", "bad");
+    return;
+  }
+
+  try {
+    setBusy(true);
+    setStatus(`Downloading ${label}...`);
+
+    const chunks = [];
+    let offset = 0;
+    let totalBytes = 0;
+
+    while (true) {
+      const response = await sendCommand(`ACAT DIAG ${topic} READ ${offset}`, [responseType], 10000);
+      totalBytes = Number(response.bytes || 0);
+
+      if (response.chunk) {
+        chunks.push(base64ToBytes(response.chunk));
+      }
+
+      const nextOffset = Number(response.nextOffset || offset);
+      if (!response.done && nextOffset <= offset) {
+        throw new Error("Device diagnostics transfer stalled.");
+      }
+      offset = nextOffset;
+
+      if (response.done) {
+        break;
+      }
+    }
+
+    if (totalBytes <= 0) {
+      setStatus(`No ${label} is stored on the device.`, "good");
+      if (careTrace) await refreshCareTraceInfo();
+      else updateDeathLogInfo({ bytes: 0, entries: 0 });
+      return;
+    }
+
+    const blob = new Blob(chunks, { type: "text/plain;charset=utf-8" });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement("a");
+    link.href = url;
+    link.download = `${state.deviceId || "adventure-catto"}-${careTrace ? "care-trace.jsonl" : "death-log.txt"}`;
+    document.body.append(link);
+    link.click();
+    link.remove();
+    window.setTimeout(() => URL.revokeObjectURL(url), 5000);
+
+    if (careTrace) await refreshCareTraceInfo();
+    else await refreshDeathLogInfo(false);
+    setStatus(`${careTrace ? "Care trace" : "Death log"} downloaded.`, "good");
+  } catch (error) {
+    setStatus(error.message || `${label} download failed.`, "bad");
+  } finally {
+    setBusy(false);
+  }
+}
+
+async function clearDeathLog() {
+  if (!port) {
+    setStatus("Connect the device first.", "bad");
+    return;
+  }
+
+  if (!window.confirm("Clear the death diagnostic log from the device?")) {
+    return;
+  }
+
+  try {
+    setBusy(true);
+    setStatus("Clearing death log...");
+    const data = await sendCommand("ACAT DIAG DEATHLOG CLEAR", ["diag-deathlog-clear"], 8000);
+    updateDeathLogInfo(data);
+    setStatus("Death log cleared.", "good");
+  } catch (error) {
+    setStatus(error.message || "Could not clear death log.", "bad");
+  } finally {
+    setBusy(false);
+  }
+}
+
 async function deleteBook(book) {
   if (!window.confirm(`Delete "${book.name}" from the device?`)) {
     return;
@@ -496,84 +753,322 @@ async function deleteBook(book) {
 }
 
 async function uploadFile(file) {
+  let job = null;
   try {
     if (!port) {
       throw new Error("Connect the device first.");
     }
 
-    let upload = await prepareUpload(file);
+    job = createUploadJob("direct");
+    setBusy(true);
+    setStatus("Preparing upload...");
+    showUploadProgress(0, "Preparing");
+
+    let upload = await prepareUpload(file, job);
     let onlineSyncMessage = "";
     let shouldSyncOnline = true;
 
-    if (canUseOnlineLibrary()) {
-      try {
-        const resolved = await resolveOnlineName(upload.name, upload.bytes.length);
-        upload = {
-          ...upload,
-          name: resolved.name,
-        };
-        if (resolved.canStore === false) {
-          shouldSyncOnline = false;
-          onlineSyncMessage = " Online library is full; uploaded to device only.";
-        }
-      } catch (error) {
-        shouldSyncOnline = false;
-        onlineSyncMessage = ` Online server is down: ${error.message || "could not reserve name"}.`;
-      }
-    }
-
     await ensureStorageFresh();
-    validateStorageForUpload(upload);
+    throwIfUploadCancelled(job);
 
-    await uploadPreparedToDevice(upload);
+    const namePlan = await chooseUploadName(upload.name, upload.bytes.length, canUseOnlineLibrary(), job);
+    upload = {
+      ...upload,
+      name: namePlan.name,
+    };
+    shouldSyncOnline = namePlan.shouldSyncOnline;
+    onlineSyncMessage = namePlan.onlineSyncMessage;
+
+    validateStorageForUpload(upload);
+    throwIfUploadCancelled(job);
+
+    await uploadPreparedToDevice(upload, job);
+    throwIfUploadCancelled(job);
 
     if (canUseOnlineLibrary() && shouldSyncOnline) {
       try {
-        await uploadPreparedToOnlineLibrary(upload, false);
+        await uploadPreparedToOnlineLibrary(upload, job);
       } catch (error) {
+        if (job.cancelRequested || isUploadCancelledError(error)) {
+          throw error;
+        }
         onlineSyncMessage = ` Online server is down: ${error.message || "backup failed"}.`;
       }
     }
 
+    throwIfUploadCancelled(job);
     setStatus(`Title uploaded.${onlineSyncMessage}`, onlineSyncMessage ? "bad" : "good");
   } catch (error) {
-    setStatus(error.message || "Upload failed.", "bad");
+    if (job && (job.cancelRequested || isUploadCancelledError(error))) {
+      await handleCancelledUpload(job);
+    } else {
+      setStatus(error.message || "Upload failed.", "bad");
+    }
   } finally {
     els.fileInput.value = "";
     window.setTimeout(() => {
       els.uploadProgress.hidden = true;
     }, 900);
+    finishUploadJob(job);
     setBusy(false);
   }
 }
 
-async function uploadPreparedToDevice(upload) {
+async function chooseUploadName(initialName, size, allowOnline, job) {
+  let name = uniqueBookNameFor(initialName, state.books);
+  let shouldSyncOnline = allowOnline;
+  let onlineSyncMessage = "";
+
+  if (!allowOnline) {
+    return { name, shouldSyncOnline: false, onlineSyncMessage };
+  }
+
+  try {
+    for (let attempt = 0; attempt < 8; attempt += 1) {
+      throwIfUploadCancelled(job);
+      const resolved = await resolveOnlineName(name, size);
+      throwIfUploadCancelled(job);
+
+      if (resolved.canStore === false) {
+        return {
+          name,
+          shouldSyncOnline: false,
+          onlineSyncMessage: " Online library is full; uploaded to device only.",
+        };
+      }
+
+      const deviceSafeName = uniqueBookNameFor(resolved.name, state.books);
+      if (deviceSafeName === resolved.name) {
+        return { name: resolved.name, shouldSyncOnline, onlineSyncMessage };
+      }
+      name = deviceSafeName;
+    }
+
+    return { name, shouldSyncOnline, onlineSyncMessage };
+  } catch (error) {
+    if (job.cancelRequested || isUploadCancelledError(error)) {
+      throw error;
+    }
+    return {
+      name,
+      shouldSyncOnline: false,
+      onlineSyncMessage: ` Online server is down: ${error.message || "could not reserve name"}.`,
+    };
+  }
+}
+
+async function uploadPreparedToDevice(upload, job) {
   let uploadStarted = false;
 
   try {
     setBusy(true);
+    job.deviceName = upload.name;
+    job.progress = 0;
     showUploadProgress(0, "Starting");
+    throwIfUploadCancelled(job);
 
     await sendCommand(`ACAT BEGIN ${textToBase64(upload.name)} ${upload.bytes.length}`, ["begin"], 10000);
     uploadStarted = true;
+    job.deviceUploadStarted = true;
+    throwIfUploadCancelled(job);
 
     const bytes = upload.bytes;
     let offset = 0;
 
     while (offset < bytes.length) {
+      throwIfUploadCancelled(job);
       const chunk = bytes.slice(offset, offset + CHUNK_SIZE);
       await sendCommand(`ACAT DATA ${bytesToBase64(chunk)}`, ["data"], 12000);
       offset += chunk.length;
-      showUploadProgress(offset / bytes.length, `${Math.round((offset / bytes.length) * 100)}%`);
+      job.progress = offset / bytes.length;
+      showUploadProgress(job.progress, `${Math.round(job.progress * 100)}%`);
+      throwIfUploadCancelled(job);
     }
 
     await sendCommand("ACAT END", ["list"], 15000);
+    job.deviceCommitted = true;
+    job.progress = 1;
     showUploadProgress(1, "Complete");
   } catch (error) {
-    if (uploadStarted) {
+    if (uploadStarted && !job.cancelRequested && !isUploadCancelledError(error)) {
       sendCommand("ACAT CANCEL", ["cancel"], 3000).catch(() => {});
     }
     throw error;
+  }
+}
+
+async function handleCancelledUpload(job) {
+  try {
+    await cleanupCancelledUpload(job);
+    setStatus("Upload cancelled.", "good");
+  } catch (error) {
+    setStatus(error.message || "Upload cancelled, but cleanup failed.", "bad");
+  }
+}
+
+async function cleanupCancelledUpload(job) {
+  if (!job || job.cleanupStarted) {
+    return;
+  }
+
+  job.cleanupStarted = true;
+  updateCancelUploadButton();
+  setStatus("Cancelling upload...");
+  showUploadProgress(job.progress || 0, "Cancelling");
+
+  const errors = [];
+
+  if (job.deviceUploadStarted && !job.deviceCommitted) {
+    try {
+      await sendCommand("ACAT CANCEL", ["cancel"], 5000);
+    } catch (error) {
+      errors.push(error.message || "device partial cleanup failed");
+    }
+  } else if (job.deviceCommitted && job.deviceName) {
+    try {
+      await sendCommand(`ACAT DELETE ${textToBase64(job.deviceName)}`, ["list"], 10000);
+    } catch (error) {
+      errors.push(error.message || "device cleanup failed");
+    }
+  }
+
+  if (job.onlineUploadStarted && job.uploadId && canUseOnlineLibrary()) {
+    try {
+      const data = await onlineJson(`/api/devices/${encodeURIComponent(state.deviceId)}/uploads/${encodeURIComponent(job.uploadId)}`, {
+        method: "DELETE",
+      });
+      updateOnlineLibrary(data);
+    } catch (error) {
+      errors.push(error.message || "online cleanup failed");
+    }
+  }
+
+  if (errors.length > 0) {
+    throw new Error(`Upload cancelled, but cleanup needs attention: ${errors.join("; ")}.`);
+  }
+}
+
+async function uploadFileToOnlineLibrary(file) {
+  let job = null;
+  try {
+    if (!canUseOnlineLibrary()) {
+      throw new Error(ONLINE_LIBRARY_API_BASE ? "Connect the device first." : "Online library is not configured.");
+    }
+
+    job = createUploadJob("online-only");
+    setBusy(true);
+    setStatus("Preparing online upload...");
+    showUploadProgress(0, "Preparing");
+    const upload = await prepareUpload(file, job);
+    throwIfUploadCancelled(job);
+    showUploadProgress(0, "Online");
+    const result = await uploadPreparedToOnlineLibrary(upload, job);
+    throwIfUploadCancelled(job);
+    showUploadProgress(1, "Complete");
+    setStatus(`Added ${result.book.name} to online library.`, "good");
+  } catch (error) {
+    if (job && (job.cancelRequested || isUploadCancelledError(error))) {
+      await handleCancelledUpload(job);
+    } else {
+      setStatus(error.message || "Online upload failed.", "bad");
+    }
+  } finally {
+    els.onlineFileInput.value = "";
+    window.setTimeout(() => {
+      els.uploadProgress.hidden = true;
+    }, 900);
+    finishUploadJob(job);
+    setBusy(false);
+  }
+}
+
+async function uploadPreparedToOnlineLibrary(upload, job) {
+  const uploadId = job?.uploadId || createUploadId();
+  const form = new FormData();
+  form.append("name", upload.name);
+  form.append("uploadId", uploadId);
+  form.append("file", new Blob([upload.bytes], { type: "text/plain" }), upload.name);
+
+  if (job) {
+    job.onlineUploadStarted = true;
+    job.progress = Math.max(job.progress || 0, 0.98);
+    showUploadProgress(job.progress, "Online");
+  }
+
+  const result = await onlineJson(`/api/devices/${encodeURIComponent(state.deviceId)}/books`, {
+    method: "POST",
+    body: form,
+  });
+
+  if (job) {
+    job.onlineCommitted = true;
+    job.onlineFileId = result.book?.id || "";
+  }
+
+  throwIfUploadCancelled(job);
+  updateOnlineLibrary(result);
+  return result;
+}
+
+async function uploadOnlineBookToDevice(book) {
+  let job = null;
+  try {
+    if (!port) {
+      throw new Error("Connect the device first.");
+    }
+
+    job = createUploadJob("online-to-device");
+    setBusy(true);
+    setStatus(`Downloading ${book.name}...`);
+    showUploadProgress(0, "Downloading");
+    const response = await onlineFetch(`/api/devices/${encodeURIComponent(state.deviceId)}/books/${encodeURIComponent(book.id)}/content`);
+    const bytes = new Uint8Array(await response.arrayBuffer());
+    throwIfUploadCancelled(job);
+
+    await ensureStorageFresh();
+    const upload = {
+      name: uniqueBookNameFor(validateBookName(book.name), state.books),
+      bytes,
+    };
+
+    validateStorageForUpload(upload);
+    throwIfUploadCancelled(job);
+    await uploadPreparedToDevice(upload, job);
+    throwIfUploadCancelled(job);
+    setStatus("Online title uploaded to device.", "good");
+  } catch (error) {
+    if (job && (job.cancelRequested || isUploadCancelledError(error))) {
+      await handleCancelledUpload(job);
+    } else {
+      setStatus(error.message || "Could not upload online title to device.", "bad");
+    }
+  } finally {
+    window.setTimeout(() => {
+      els.uploadProgress.hidden = true;
+    }, 900);
+    finishUploadJob(job);
+    setBusy(false);
+  }
+}
+
+function uniqueBookNameFor(name, books) {
+  const existing = new Set(books.map((book) => book.name.toLowerCase()));
+  const original = validateBookName(name);
+  if (!existing.has(original.toLowerCase())) {
+    return original;
+  }
+
+  const extension = ".txt";
+  const base = original.slice(0, -extension.length);
+  let index = 1;
+
+  while (true) {
+    const suffix = ` (${index})${extension}`;
+    const candidate = validateBookName(`${base.slice(0, 96 - suffix.length)}${suffix}`);
+    if (!existing.has(candidate.toLowerCase())) {
+      return candidate;
+    }
+    index += 1;
   }
 }
 
@@ -627,71 +1122,6 @@ async function resolveOnlineName(name, size) {
   });
 }
 
-async function uploadFileToOnlineLibrary(file) {
-  try {
-    if (!canUseOnlineLibrary()) {
-      throw new Error(ONLINE_LIBRARY_API_BASE ? "Connect the device first." : "Online library is not configured.");
-    }
-
-    const upload = await prepareUpload(file);
-    setBusy(true);
-    showUploadProgress(0, "Online");
-    const result = await uploadPreparedToOnlineLibrary(upload);
-    showUploadProgress(1, "Complete");
-    setStatus(`Added ${result.book.name} to online library.`, "good");
-  } catch (error) {
-    setStatus(error.message || "Online upload failed.", "bad");
-  } finally {
-    els.onlineFileInput.value = "";
-    window.setTimeout(() => {
-      els.uploadProgress.hidden = true;
-    }, 900);
-    setBusy(false);
-  }
-}
-
-async function uploadPreparedToOnlineLibrary(upload) {
-  const form = new FormData();
-  form.append("name", upload.name);
-  form.append("file", new Blob([upload.bytes], { type: "text/plain" }), upload.name);
-
-  const result = await onlineJson(`/api/devices/${encodeURIComponent(state.deviceId)}/books`, {
-    method: "POST",
-    body: form,
-  });
-  updateOnlineLibrary(result);
-  return result;
-}
-
-async function uploadOnlineBookToDevice(book) {
-  try {
-    if (!port) {
-      throw new Error("Connect the device first.");
-    }
-
-    setBusy(true);
-    setStatus(`Downloading ${book.name}...`);
-    const response = await onlineFetch(`/api/devices/${encodeURIComponent(state.deviceId)}/books/${encodeURIComponent(book.id)}/content`);
-    const bytes = new Uint8Array(await response.arrayBuffer());
-    const upload = {
-      name: validateBookName(book.name),
-      bytes,
-    };
-
-    await ensureStorageFresh();
-    validateStorageForUpload(upload);
-    await uploadPreparedToDevice(upload);
-    setStatus("Online title uploaded to device.", "good");
-  } catch (error) {
-    setStatus(error.message || "Could not upload online title to device.", "bad");
-  } finally {
-    window.setTimeout(() => {
-      els.uploadProgress.hidden = true;
-    }, 900);
-    setBusy(false);
-  }
-}
-
 async function deleteOnlineBook(book) {
   if (!window.confirm(`Delete "${book.name}" from the online library?`)) {
     return;
@@ -740,13 +1170,16 @@ async function onlineJson(path, options = {}) {
   return data;
 }
 
-async function prepareUpload(file) {
+async function prepareUpload(file, job) {
   const source = validateSourceFile(file);
+  throwIfUploadCancelled(job);
 
   if (source.extension === "txt") {
+    const bytes = new Uint8Array(await file.arrayBuffer());
+    throwIfUploadCancelled(job);
     return {
       name: validateBookName(file.name),
-      bytes: new Uint8Array(await file.arrayBuffer()),
+      bytes,
     };
   }
 
@@ -754,14 +1187,16 @@ async function prepareUpload(file) {
     setBusy(true);
     setStatus("Converting EPUB to text...");
     showUploadProgress(0, "Converting");
-    const text = await convertEpubToText(file);
+    const text = await convertEpubToText(file, job);
+    throwIfUploadCancelled(job);
     return makeTextUpload(file.name, text);
   }
 
   setBusy(true);
   setStatus("Converting PDF to text...");
   showUploadProgress(0, "Converting");
-  const text = await convertPdfToText(file);
+  const text = await convertPdfToText(file, job);
+  throwIfUploadCancelled(job);
   return makeTextUpload(file.name, text);
 }
 
@@ -809,8 +1244,11 @@ function validateStorageForUpload(upload) {
   }
 
   const existing = state.books.find((book) => book.name === upload.name);
-  const replaceBytes = existing ? existing.size : 0;
-  const available = storage.free + replaceBytes;
+  if (existing) {
+    throw new Error("A title with this name already exists on the device.");
+  }
+
+  const available = storage.free;
 
   if (upload.bytes.length > available) {
     throw new Error(`Not enough free storage. ${formatBytes(available)} is available for this file.`);
@@ -840,12 +1278,13 @@ function txtNameFor(name) {
   return `${base}.txt`;
 }
 
-async function convertEpubToText(file) {
+async function convertEpubToText(file, job) {
   if (!window.JSZip) {
     throw new Error("EPUB conversion library is not loaded.");
   }
 
   const zip = await window.JSZip.loadAsync(await file.arrayBuffer());
+  throwIfUploadCancelled(job);
   const containerText = await readZipText(zip, "META-INF/container.xml");
   const containerDoc = parseXml(containerText, "EPUB container");
   const rootfile = firstByLocalName(containerDoc, "rootfile");
@@ -873,6 +1312,7 @@ async function convertEpubToText(file) {
 
   const sections = [];
   for (const itemref of allByLocalName(opfDoc, "itemref")) {
+    throwIfUploadCancelled(job);
     const manifestItem = manifest.get(itemref.getAttribute("idref"));
     if (!manifestItem || !isHtmlMediaType(manifestItem.mediaType, manifestItem.href)) {
       continue;
@@ -894,7 +1334,7 @@ async function convertEpubToText(file) {
   return sections.join("\n\n");
 }
 
-async function convertPdfToText(file) {
+async function convertPdfToText(file, job) {
   if (!window.pdfjsLib) {
     throw new Error("PDF conversion library is not loaded.");
   }
@@ -908,6 +1348,7 @@ async function convertPdfToText(file) {
   const pages = [];
 
   for (let pageNumber = 1; pageNumber <= pdf.numPages; pageNumber += 1) {
+    throwIfUploadCancelled(job);
     const page = await pdf.getPage(pageNumber);
     const content = await page.getTextContent();
     const pageText = extractPdfPageText(content.items || []);
@@ -1073,9 +1514,14 @@ function cleanText(text) {
 }
 
 async function ensureStorageFresh() {
-  if (!state.storage) {
-    await refreshLibrary();
+  if (!port) {
+    if (!state.storage) {
+      throw new Error("Storage details are not available yet.");
+    }
+    return;
   }
+
+  await sendCommand("ACAT LIST", ["list"], 8000);
 }
 
 function updateStorage(storage) {
@@ -1140,6 +1586,55 @@ function updateBooks(books) {
   });
 
   renderStorage();
+}
+
+function resetDiagnostics() {
+  state.deathLog = null;
+  state.careTrace = null;
+  renderDiagnostics();
+}
+
+function updateDeathLogInfo(data) {
+  state.deathLog = {
+    bytes: Number(data.bytes || 0),
+    entries: Number(data.entries || 0),
+  };
+  renderDiagnostics();
+}
+
+function renderDiagnostics() {
+  const connected = Boolean(port);
+  els.diagnosticsSection.hidden = !connected;
+
+  if (!connected) {
+    return;
+  }
+
+  if (!state.deathLog) {
+    els.deathLogInfo.textContent = "Unavailable";
+  } else {
+    const entries = state.deathLog.entries || 0;
+    els.deathLogInfo.textContent = `${entries} ${entries === 1 ? "Record" : "Records"} - ${formatBytes(state.deathLog.bytes || 0)}`;
+  }
+
+  updateDiagnosticsControls();
+}
+
+function updateDiagnosticsControls() {
+  if (!els.downloadDeathLogButton || !els.clearDeathLogButton) {
+    return;
+  }
+
+  const hasLog = Boolean(port && state.deathLog && state.deathLog.bytes > 0);
+  els.downloadDeathLogButton.disabled = busy || !hasLog;
+  els.clearDeathLogButton.disabled = busy || !hasLog;
+  if (!els.downloadCareTraceButton || !els.clearCareTraceButton || !els.careTraceInfo) return;
+  const hasTrace = Boolean(port && state.careTrace && state.careTrace.bytes > 0);
+  els.downloadCareTraceButton.disabled = busy || !hasTrace;
+  els.clearCareTraceButton.disabled = busy || !hasTrace;
+  els.careTraceInfo.textContent = state.careTrace
+    ? `${state.careTrace.entries} ${state.careTrace.entries === 1 ? "Record" : "Records"} - ${formatBytes(state.careTrace.bytes)}`
+    : "Unavailable";
 }
 
 function resetOnlineLibrary() {
@@ -1252,6 +1747,15 @@ function bytesToBase64(bytes) {
   return btoa(binary);
 }
 
+function base64ToBytes(encoded) {
+  const binary = atob(encoded || "");
+  const bytes = new Uint8Array(binary.length);
+  for (let index = 0; index < binary.length; index += 1) {
+    bytes[index] = binary.charCodeAt(index);
+  }
+  return bytes;
+}
+
 function formatBytes(value) {
   if (!Number.isFinite(value) || value <= 0) {
     return "0 B";
@@ -1333,5 +1837,6 @@ function stopHeartbeat() {
 }
 
 renderStorage();
+resetDiagnostics();
 resetOnlineLibrary();
 setBusy(false);

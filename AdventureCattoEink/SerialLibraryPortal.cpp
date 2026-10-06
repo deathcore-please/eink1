@@ -1,4 +1,5 @@
 #include "SerialLibraryPortal.h"
+#include "PetTrace.h"
 
 #include <Arduino.h>
 #include <LittleFS.h>
@@ -16,6 +17,12 @@ constexpr const char* RESPONSE_PREFIX = "ACAT ";
 constexpr uint32_t PORTAL_KEEP_AWAKE_MS = 90UL * 1000UL;
 constexpr const char* DEVICE_ID_NAMESPACE = "acat-device";
 constexpr const char* DEVICE_ID_KEY = "deviceId";
+constexpr const char* DIAGNOSTICS_DIR = "/system";
+constexpr const char* DEATH_LOG_PATH = "/system/death_log.txt";
+constexpr const char* DEATH_LOG_TMP_PATH = "/system/death_log.tmp";
+constexpr size_t DEATH_LOG_MAX_BYTES = 64UL * 1024UL;
+constexpr size_t DEATH_LOG_TRIM_TO_BYTES = 48UL * 1024UL;
+constexpr size_t DIAG_READ_CHUNK_BYTES = 192;
 
 String commandLine;
 bool storageReady = false;
@@ -230,6 +237,32 @@ void printJsonString(const String& value) {
   Serial.print('"');
 }
 
+void appendJsonStringTo(String& out, const char* value) {
+  out += '"';
+  if (value == nullptr) {
+    out += '"';
+    return;
+  }
+
+  for (size_t i = 0; value[i] != '\0'; ++i) {
+    char c = value[i];
+    if (c == '"' || c == '\\') {
+      out += '\\';
+      out += c;
+    } else if (c == '\n') {
+      out += "\\n";
+    } else if (c == '\r') {
+      out += "\\r";
+    } else if (c == '\t') {
+      out += "\\t";
+    } else if (c >= 32) {
+      out += c;
+    }
+  }
+
+  out += '"';
+}
+
 void printStorageJson() {
   StorageStats stats = storageGetStats();
   size_t freeBytes = stats.totalBytes > stats.usedBytes ? stats.totalBytes - stats.usedBytes : 0;
@@ -243,6 +276,139 @@ void printStorageJson() {
   Serial.print('}');
 }
 
+bool ensureDiagnosticsDir() {
+  if (!ensureStorage()) {
+    return false;
+  }
+
+  if (LittleFS.exists(DIAGNOSTICS_DIR)) {
+    return true;
+  }
+
+  return LittleFS.mkdir(DIAGNOSTICS_DIR);
+}
+
+size_t countDeathLogEntries() {
+  if (!LittleFS.exists(DEATH_LOG_PATH)) {
+    return 0;
+  }
+
+  File file = LittleFS.open(DEATH_LOG_PATH, "r");
+  if (!file) {
+    return 0;
+  }
+
+  size_t count = 0;
+  bool sawContent = false;
+  bool endedWithNewline = true;
+  while (file.available()) {
+    char c = static_cast<char>(file.read());
+    sawContent = true;
+    endedWithNewline = (c == '\n');
+    if (c == '\n') {
+      count++;
+    }
+  }
+  file.close();
+
+  if (sawContent && !endedWithNewline) {
+    count++;
+  }
+
+  return count;
+}
+
+size_t deathLogSize() {
+  if (!LittleFS.exists(DEATH_LOG_PATH)) {
+    return 0;
+  }
+
+  File file = LittleFS.open(DEATH_LOG_PATH, "r");
+  if (!file) {
+    return 0;
+  }
+
+  size_t size = file.size();
+  file.close();
+  return size;
+}
+
+bool trimDeathLogForAppend(size_t incomingBytes) {
+  if (incomingBytes >= DEATH_LOG_MAX_BYTES) {
+    LittleFS.remove(DEATH_LOG_PATH);
+    LittleFS.remove(DEATH_LOG_TMP_PATH);
+    return true;
+  }
+
+  if (!LittleFS.exists(DEATH_LOG_PATH)) {
+    return true;
+  }
+
+  File file = LittleFS.open(DEATH_LOG_PATH, "r");
+  if (!file) {
+    return false;
+  }
+
+  size_t size = file.size();
+  if (size + incomingBytes <= DEATH_LOG_MAX_BYTES) {
+    file.close();
+    return true;
+  }
+
+  size_t keepBytes = min(DEATH_LOG_TRIM_TO_BYTES, size);
+  size_t start = size - keepBytes;
+  if (!file.seek(start)) {
+    file.close();
+    return false;
+  }
+
+  String tail;
+  tail.reserve(keepBytes);
+  while (file.available()) {
+    tail += static_cast<char>(file.read());
+  }
+  file.close();
+
+  if (start > 0) {
+    int newlineAt = tail.indexOf('\n');
+    if (newlineAt >= 0) {
+      tail.remove(0, newlineAt + 1);
+    }
+  }
+
+  LittleFS.remove(DEATH_LOG_TMP_PATH);
+  File trimmed = LittleFS.open(DEATH_LOG_TMP_PATH, "w");
+  if (!trimmed) {
+    return false;
+  }
+  trimmed.print(tail);
+  trimmed.close();
+
+  LittleFS.remove(DEATH_LOG_PATH);
+  return LittleFS.rename(DEATH_LOG_TMP_PATH, DEATH_LOG_PATH);
+}
+
+bool appendDeathLogLine(const String& line) {
+  if (!ensureDiagnosticsDir()) {
+    return false;
+  }
+
+  String entry = line;
+  entry += '\n';
+  if (!trimDeathLogForAppend(entry.length())) {
+    return false;
+  }
+
+  File file = LittleFS.open(DEATH_LOG_PATH, "a");
+  if (!file) {
+    return false;
+  }
+
+  size_t written = file.print(entry);
+  file.close();
+  return written == entry.length();
+}
+
 void sendError(const String& type, const String& message) {
   Serial.print(RESPONSE_PREFIX);
   Serial.print("{\"ok\":false,\"type\":");
@@ -250,6 +416,184 @@ void sendError(const String& type, const String& message) {
   Serial.print(",\"message\":");
   printJsonString(message);
   Serial.println('}');
+}
+
+void sendDeathLogInfo() {
+  if (!ensureDiagnosticsDir()) {
+    sendError("diag-deathlog-info", "LittleFS is not mounted");
+    return;
+  }
+
+  Serial.print(RESPONSE_PREFIX);
+  Serial.print("{\"ok\":true,\"type\":\"diag-deathlog-info\",\"bytes\":");
+  Serial.print(deathLogSize());
+  Serial.print(",\"entries\":");
+  Serial.print(countDeathLogEntries());
+  Serial.print(',');
+  printStorageJson();
+  Serial.println('}');
+}
+
+void printBase64Encoded(const uint8_t* data, size_t length) {
+  static const char alphabet[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+  for (size_t i = 0; i < length; i += 3) {
+    uint32_t value = static_cast<uint32_t>(data[i]) << 16;
+    bool hasSecond = (i + 1) < length;
+    bool hasThird = (i + 2) < length;
+
+    if (hasSecond) {
+      value |= static_cast<uint32_t>(data[i + 1]) << 8;
+    }
+    if (hasThird) {
+      value |= data[i + 2];
+    }
+
+    Serial.print(alphabet[(value >> 18) & 0x3F]);
+    Serial.print(alphabet[(value >> 12) & 0x3F]);
+    Serial.print(hasSecond ? alphabet[(value >> 6) & 0x3F] : '=');
+    Serial.print(hasThird ? alphabet[value & 0x3F] : '=');
+  }
+}
+
+void handleDiagDeathLogRead(const String& offsetText) {
+  if (!ensureDiagnosticsDir()) {
+    sendError("diag-deathlog-read", "LittleFS is not mounted");
+    return;
+  }
+
+  uint32_t offset = offsetText.length() > 0
+                    ? static_cast<uint32_t>(strtoul(offsetText.c_str(), nullptr, 10))
+                    : 0;
+  size_t totalBytes = deathLogSize();
+  uint8_t buffer[DIAG_READ_CHUNK_BYTES] = {};
+  size_t bytesRead = 0;
+
+  if (offset < totalBytes && LittleFS.exists(DEATH_LOG_PATH)) {
+    File file = LittleFS.open(DEATH_LOG_PATH, "r");
+    if (!file) {
+      sendError("diag-deathlog-read", "Death log could not be opened");
+      return;
+    }
+
+    if (!file.seek(offset)) {
+      file.close();
+      sendError("diag-deathlog-read", "Death log offset is invalid");
+      return;
+    }
+
+    size_t bytesToRead = DIAG_READ_CHUNK_BYTES;
+    size_t remaining = totalBytes - offset;
+    if (remaining < bytesToRead) {
+      bytesToRead = remaining;
+    }
+    bytesRead = file.read(buffer, bytesToRead);
+    file.close();
+  } else if (offset > totalBytes) {
+    offset = totalBytes;
+  }
+
+  size_t nextOffset = offset + bytesRead;
+  bool done = nextOffset >= totalBytes;
+
+  Serial.print(RESPONSE_PREFIX);
+  Serial.print("{\"ok\":true,\"type\":\"diag-deathlog-read\",\"offset\":");
+  Serial.print(offset);
+  Serial.print(",\"nextOffset\":");
+  Serial.print(nextOffset);
+  Serial.print(",\"bytes\":");
+  Serial.print(totalBytes);
+  Serial.print(",\"done\":");
+  Serial.print(done ? "true" : "false");
+  Serial.print(",\"chunk\":\"");
+  printBase64Encoded(buffer, bytesRead);
+  Serial.println("\"}");
+}
+
+void handleDiagDeathLogClear() {
+  if (!ensureDiagnosticsDir()) {
+    sendError("diag-deathlog-clear", "LittleFS is not mounted");
+    return;
+  }
+
+  LittleFS.remove(DEATH_LOG_PATH);
+  LittleFS.remove(DEATH_LOG_TMP_PATH);
+
+  Serial.print(RESPONSE_PREFIX);
+  Serial.print("{\"ok\":true,\"type\":\"diag-deathlog-clear\",\"bytes\":0,\"entries\":0,");
+  printStorageJson();
+  Serial.println('}');
+}
+
+void handleDiag(const String& args) {
+  if (uploadActive) {
+    sendError("diag", "Upload is active");
+    return;
+  }
+
+  int split = args.indexOf(' ');
+  String topic = split >= 0 ? args.substring(0, split) : args;
+  String rest = split >= 0 ? args.substring(split + 1) : "";
+  topic.toUpperCase();
+  rest.trim();
+
+  if (topic != "DEATHLOG" && topic != "CARETRACE") {
+    sendError("diag", "Unknown diagnostics target");
+    return;
+  }
+
+  int actionSplit = rest.indexOf(' ');
+  String action = actionSplit >= 0 ? rest.substring(0, actionSplit) : rest;
+  String actionArgs = actionSplit >= 0 ? rest.substring(actionSplit + 1) : "";
+  action.toUpperCase();
+  actionArgs.trim();
+
+  if (topic == "CARETRACE") {
+    String type = "diag-caretrace-";
+    String lowerAction = action;
+    lowerAction.toLowerCase();
+    type += lowerAction;
+    size_t bytes = 0, entries = 0;
+    if (action == "INFO") {
+      if (!PetTrace::info(bytes, entries)) { sendError(type, "Care trace could not be opened"); return; }
+    } else if (action == "READ") {
+      uint32_t offset = static_cast<uint32_t>(strtoul(actionArgs.c_str(), nullptr, 10));
+      uint8_t buffer[768];
+      size_t count = 0;
+      if (!PetTrace::read(offset, buffer, sizeof(buffer), count, bytes)) {
+        sendError(type, "Care trace read failed; restart the download"); return;
+      }
+      Serial.print(RESPONSE_PREFIX);
+      Serial.print("{\"ok\":true,\"type\":\"diag-caretrace-read\",\"offset\":");
+      Serial.print(offset);
+      Serial.print(",\"nextOffset\":"); Serial.print(offset + count);
+      Serial.print(",\"bytes\":"); Serial.print(bytes);
+      Serial.print(",\"done\":"); Serial.print(offset + count >= bytes ? "true" : "false");
+      Serial.print(",\"chunk\":\""); printBase64Encoded(buffer, count);
+      Serial.println("\"}");
+      return;
+    } else if (action == "CLEAR") {
+      if (!PetTrace::clear()) { sendError(type, "Care trace could not be cleared"); return; }
+    } else {
+      sendError("diag", "Unknown care trace command"); return;
+    }
+    Serial.print(RESPONSE_PREFIX);
+    Serial.print("{\"ok\":true,\"type\":"); printJsonString(type);
+    Serial.print(",\"bytes\":"); Serial.print(bytes);
+    Serial.print(",\"entries\":"); Serial.print(entries);
+    Serial.print(','); printStorageJson(); Serial.println('}');
+    return;
+  }
+
+  if (action == "INFO") {
+    sendDeathLogInfo();
+  } else if (action == "READ") {
+    handleDiagDeathLogRead(actionArgs);
+  } else if (action == "CLEAR") {
+    handleDiagDeathLogClear();
+  } else {
+    sendError("diag", "Unknown death log command");
+  }
 }
 
 void sendSimpleOk(const String& type) {
@@ -618,6 +962,8 @@ void handleCommand(String line) {
   } else if (command == "CANCEL") {
     cancelUpload(true);
     sendSimpleOk("cancel");
+  } else if (command == "DIAG") {
+    handleDiag(args);
   } else {
     sendError("command", "Unknown command");
   }
@@ -627,6 +973,122 @@ void handleCommand(String line) {
 
 void serialLibraryPortalBegin() {
   commandLine.reserve(MAX_COMMAND_LINE);
+}
+
+void serialLibraryPortalAppendDeathLog(
+  const char* reason,
+  uint32_t epochSeconds,
+  uint32_t millisValue,
+  int wakeCause,
+  int appMode,
+  int petMode,
+  int activeAction,
+  bool pendingRunaway,
+  uint8_t happiness,
+  uint8_t pee,
+  uint8_t food,
+  uint8_t play,
+  uint8_t pets,
+  uint32_t lastNeedDrainEpoch,
+  uint32_t peeDrainCarry,
+  uint32_t foodDrainCarry,
+  uint32_t playDrainCarry,
+  uint32_t petsDrainCarry,
+  uint32_t happinessCrisisCarry,
+  uint8_t happinessCrisisPenalty,
+  bool sleeping,
+  uint32_t sleepStartEpoch,
+  uint32_t sleepDurationSec,
+  const PetCare::State& care
+) {
+  String line;
+  line.reserve(1800);
+  line += "{\"event\":\"runaway\",\"reason\":";
+  appendJsonStringTo(line, reason);
+  line += ",\"epoch\":";
+  line += String(epochSeconds);
+  line += ",\"millis\":";
+  line += String(millisValue);
+  line += ",\"wakeCause\":";
+  line += String(wakeCause);
+  line += ",\"appMode\":";
+  line += String(appMode);
+  line += ",\"petMode\":";
+  line += String(petMode);
+  line += ",\"activeAction\":";
+  line += String(activeAction);
+  line += ",\"happiness\":";
+  line += String(happiness);
+  line += ",\"pee\":";
+  line += String(pee);
+  line += ",\"food\":";
+  line += String(food);
+  line += ",\"play\":";
+  line += String(play);
+  line += ",\"pets\":";
+  line += String(pets);
+  line += ",\"pendingRunaway\":";
+  line += pendingRunaway ? "true" : "false";
+  line += ",\"lastNeedDrainEpoch\":";
+  line += String(lastNeedDrainEpoch);
+  line += ",\"peeDrainCarry\":";
+  line += String(peeDrainCarry);
+  line += ",\"foodDrainCarry\":";
+  line += String(foodDrainCarry);
+  line += ",\"playDrainCarry\":";
+  line += String(playDrainCarry);
+  line += ",\"petsDrainCarry\":";
+  line += String(petsDrainCarry);
+  line += ",\"happinessCrisisCarry\":";
+  line += String(happinessCrisisCarry);
+  line += ",\"happinessCrisisPenalty\":";
+  line += String(happinessCrisisPenalty);
+  line += ",\"sleeping\":";
+  line += sleeping ? "true" : "false";
+  line += ",\"sleepStartEpoch\":";
+  line += String(sleepStartEpoch);
+  line += ",\"sleepDurationSec\":";
+  line += String(sleepDurationSec);
+  line += ",\"drainCarryScale\":10000,\"crisisCarryScale\":100,\"care\":{";
+  const char* categoryNames[PetCare::Count] = {"overall", "pee", "play", "food"};
+  const char* modeNames[] = {"normal", "happy", "sad"};
+  for (uint8_t i = 0; i < PetCare::Count; ++i) {
+    const PetCare::CategoryState& category = care.categories[i];
+    if (i) line += ',';
+    appendJsonStringTo(line, categoryNames[i]);
+    line += ":{\"applied\":";
+    appendJsonStringTo(line, modeNames[category.applied <= PetCare::Sad ? category.applied : PetCare::Normal]);
+    line += ",\"qualified\":";
+    appendJsonStringTo(line, modeNames[category.qualified <= PetCare::Sad ? category.qualified : PetCare::Normal]);
+    line += ",\"ratePercent\":";
+    line += String(PetCare::ratePercent(care, static_cast<PetCare::Category>(i)));
+    line += ",\"happySince\":";
+    line += String(category.high ? category.happySince : 0);
+    line += ",\"recoverySince\":";
+    line += String(category.recovering ? category.recoverySince : 0);
+    line += ",\"dips\":[";
+    for (uint8_t n = 0; n < category.dipCount; ++n) {
+      if (n) line += ',';
+      line += String(category.dips[n]);
+    }
+    line += "]}";
+  }
+  line += "},\"needRatesBps\":{";
+  const char* needNames[] = {"pee", "food", "play", "pets"};
+  const PetCare::Category individualCategories[] = {PetCare::Pee, PetCare::Food, PetCare::Play, PetCare::Count};
+  uint32_t overallRate = PetCare::ratePercent(care, PetCare::Overall);
+  for (uint8_t i = 0; i < 4; ++i) {
+    if (i) line += ',';
+    appendJsonStringTo(line, needNames[i]);
+    line += ':';
+    line += String(overallRate * PetCare::ratePercent(care, individualCategories[i]));
+  }
+  line += "}";
+  line += "}";
+
+  if (!appendDeathLogLine(line)) {
+    Serial.println("Death diagnostic log append failed");
+  }
 }
 
 bool serialLibraryPortalLoop() {

@@ -16,12 +16,12 @@ namespace Config {
   constexpr int PIN_EPD_BUSY = 9;
   constexpr int PIN_EPD_POWER = 7;
 
-  // Button pins (align with factory mappings)
-  constexpr int PIN_BTN_HOME = 2;
+  // Button roles: toggle press = home, top button = OK.
+  constexpr int PIN_BTN_HOME = 5;
   constexpr int PIN_BTN_EXIT = 1;
   constexpr int PIN_BTN_PREV = 6;
   constexpr int PIN_BTN_NEXT = 4;
-  constexpr int PIN_BTN_OK = 5;
+  constexpr int PIN_BTN_OK = 2;
 
   constexpr bool BUTTON_PULLUP = false;
   constexpr uint32_t BUTTON_DEBOUNCE_MS = 30;

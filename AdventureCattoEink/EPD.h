@@ -17,4 +17,6 @@ void EPD_ShowNum(uint16_t x, uint16_t y, uint32_t num, uint8_t len, uint8_t colo
 void EPD_ShowFloatNum(uint16_t x, uint16_t y, float num, uint8_t pre, uint8_t len, uint8_t color, uint8_t sizey);  // 显示浮点数
 void EPD_ShowPicture(uint16_t x, uint16_t y, uint16_t width, uint16_t height, const uint8_t pic[], uint8_t color); // 图片显示
 void EPD_ShowWatch(uint16_t x, uint16_t y, float num, uint8_t pre, uint8_t len, uint8_t color, uint8_t sizey);     // 显示秒表
+// Transparent 8x16 text with an extra x+1 ink stroke; stops at non-printable ASCII.
+void EPD_ShowStringBold16(uint16_t x, uint16_t y, const char* text, uint8_t color);
 #endif

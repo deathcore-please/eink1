@@ -11,3 +11,8 @@ python -m http.server 8080
 ```
 
 Then open `http://localhost:8080`.
+
+When connected, Diagnostics can download or clear the original death log and
+the separate care trace. The trace includes state before/after suspicious
+drain updates, clock/uptime comparisons, and mode/USB transitions. Neither log
+is uploaded to the online library. See `../tests/CARE_TRACE.md` for the format.
